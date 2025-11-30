@@ -2149,15 +2149,58 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
             }
         }
 
-        // PRODUCTION FIX: Frame pacing to prevent jumpiness
-        // Hardware decode is very fast (<1ms), we must enforce proper frame timing
-        // to match video FPS and display refresh rate
-        if (remaining_time > 0.0005) {  // Sleep if we have at least 0.5ms remaining
-            struct timespec sleep_time;
-            sleep_time.tv_sec = 0;
-            sleep_time.tv_nsec = (long)(remaining_time * 1000000000);
-            if (sleep_time.tv_nsec < 0) sleep_time.tv_nsec = 0;  // Clamp to 0
-            nanosleep(&sleep_time, NULL);
+        // OPTIMIZED: Absolute timing with clock_nanosleep to eliminate cumulative drift
+        // Wake up 1.5ms early to allow vsync in eglSwapBuffers to handle final sync
+        // This prevents nanosleep overshoot from causing frame drops
+        static struct timespec next_frame_time = {0, 0};
+        static bool timing_initialized = false;
+
+        if (!timing_initialized) {
+            clock_gettime(CLOCK_MONOTONIC, &next_frame_time);
+            timing_initialized = true;
+        }
+
+        // Calculate when next frame should be displayed (absolute time)
+        double target_seconds = target_frame_time;
+        long target_nsec = (long)(target_seconds * 1000000000);
+        next_frame_time.tv_nsec += target_nsec;
+        // Handle nanosecond overflow
+        if (next_frame_time.tv_nsec >= 1000000000) {
+            next_frame_time.tv_sec += next_frame_time.tv_nsec / 1000000000;
+            next_frame_time.tv_nsec %= 1000000000;
+        }
+
+        // Get current time
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+
+        // Calculate time until next frame
+        double time_until_next = (next_frame_time.tv_sec - now.tv_sec) +
+                                 (next_frame_time.tv_nsec - now.tv_nsec) / 1e9;
+
+        // Sleep until 1.5ms before target, let vsync handle the rest
+        // This reduces nanosleep jitter impact
+        const double early_wakeup_margin = 0.0015;  // 1.5ms early wakeup
+
+        if (time_until_next > early_wakeup_margin) {
+            struct timespec wakeup_time = next_frame_time;
+            long wakeup_ns_early = (long)(early_wakeup_margin * 1000000000);
+            wakeup_time.tv_nsec -= wakeup_ns_early;
+            if (wakeup_time.tv_nsec < 0) {
+                wakeup_time.tv_sec -= 1;
+                wakeup_time.tv_nsec += 1000000000;
+            }
+
+            // Use TIMER_ABSTIME for absolute timing (no cumulative drift)
+            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wakeup_time, NULL);
+        }
+
+        // If we're way behind (> 2 frames), reset timing to prevent infinite catchup
+        if (time_until_next < -target_frame_time * 2.0) {
+            clock_gettime(CLOCK_MONOTONIC, &next_frame_time);
+            if (app->show_timing) {
+                LOG_WARN("TIMING", "Timing reset - fell behind by %.1fms", -time_until_next * 1000);
+            }
         }
 
         if (app->show_timing && total_frame_time > target_frame_time * 1.5) {
