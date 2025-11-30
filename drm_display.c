@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "drm_display.h"
+#include "logging.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,30 +25,30 @@ static int find_drm_device(void) {
     for (int i = 0; drm_device_paths[i]; i++) {
         int fd = open(drm_device_paths[i], O_RDWR | O_CLOEXEC);
         if (fd < 0) {
-            printf("⊗ %s: Cannot open (%s)\n", drm_device_paths[i], strerror(errno));
+            LOG_WARN("DRM", "⊗ %s: Cannot open (%s)", drm_device_paths[i], strerror(errno));
             continue;
         }
         
-        printf("✓ %s: Opened successfully, checking resources...\n", drm_device_paths[i]);
+        LOG_INFO("DRM", "✓ %s: Opened successfully, checking resources...", drm_device_paths[i]);
         
         // Test if this device actually works (has display resources)
         drmModeRes *resources = drmModeGetResources(fd);
         if (resources) {
-            printf("✓ Found working DRM device: %s\n", drm_device_paths[i]);
-            printf("  - Connectors: %d\n", resources->count_connectors);
-            printf("  - Encoders: %d\n", resources->count_encoders);
-            printf("  - CRTCs: %d\n", resources->count_crtcs);
+            LOG_INFO("DRM", "✓ Found working DRM device: %s", drm_device_paths[i]);
+            LOG_INFO("DRM", "  - Connectors: %d", resources->count_connectors);
+            LOG_INFO("DRM", "  - Encoders: %d", resources->count_encoders);
+            LOG_INFO("DRM", "  - CRTCs: %d", resources->count_crtcs);
             drmModeFreeResources(resources);
             return fd;
         }
         
         // This device didn't work, get more details
-        printf("⊗ %s opened but drmModeGetResources failed\n", drm_device_paths[i]);
+        LOG_WARN("DRM", "⊗ %s opened but drmModeGetResources failed", drm_device_paths[i]);
         
         // Try to get driver info
         drmVersion *version = drmGetVersion(fd);
         if (version) {
-            printf("  Driver: %s (version %d.%d.%d)\n", 
+            LOG_INFO("DRM", "  Driver: %s (version %d.%d.%d)", 
                    version->name, version->version_major, 
                    version->version_minor, version->version_patchlevel);
             drmFreeVersion(version);
@@ -56,33 +57,33 @@ static int find_drm_device(void) {
         // Check capabilities
         uint64_t cap_dumb = 0;
         drmGetCap(fd, DRM_CAP_DUMB_BUFFER, &cap_dumb);
-        printf("  DRM_CAP_DUMB_BUFFER: %s\n", cap_dumb ? "yes" : "no");
+        LOG_INFO("DRM", "  DRM_CAP_DUMB_BUFFER: %s", cap_dumb ? "yes" : "no");
         
         uint64_t cap_prime = 0;
         drmGetCap(fd, DRM_CAP_PRIME, &cap_prime);
-        printf("  DRM_CAP_PRIME: %s\n", cap_prime ? "yes" : "no");
+        LOG_INFO("DRM", "  DRM_CAP_PRIME: %s", cap_prime ? "yes" : "no");
         
         close(fd);
     }
     
-    printf("\nTroubleshooting:\n");
-    printf("1. Make sure you're in the 'render' group: groups | grep render\n");
-    printf("2. If not, run: sudo usermod -a -G render $USER && logout\n");
-    printf("3. Or try with sudo: sudo ./pickel <video>\n");
-    printf("\nDevice details (try manually):\n");
-    printf("  modetest -c\n");
-    printf("  lspci | grep VGA\n");
-    printf("  dmesg | grep -i drm\n");
+    LOG_ERROR("DRM", "\nTroubleshooting:");
+    LOG_ERROR("DRM", "1. Make sure you're in the 'render' group: groups | grep render");
+    LOG_ERROR("DRM", "2. If not, run: sudo usermod -a -G render $USER && logout");
+    LOG_ERROR("DRM", "3. Or try with sudo: sudo ./pickel <video>");
+    LOG_ERROR("DRM", "\nDevice details (try manually):");
+    LOG_ERROR("DRM", "  modetest -c");
+    LOG_ERROR("DRM", "  lspci | grep VGA");
+    LOG_ERROR("DRM", "  dmesg | grep -i drm");
     return -1;
 }
 static drmModeConnector* find_connector(display_ctx_t *drm) {
     drmModeRes *resources = drmModeGetResources(drm->drm_fd);
     if (!resources) {
-        fprintf(stderr, "Failed to get DRM resources\n");
-        fprintf(stderr, "This usually means:\n");
-        fprintf(stderr, "  1. No GPU/display driver loaded\n");
-        fprintf(stderr, "  2. Running in SSH without display\n");
-        fprintf(stderr, "  3. Need to run on the Pi's console directly\n");
+        LOG_ERROR("DRM", "Failed to get DRM resources");
+        LOG_ERROR("DRM", "This usually means:");
+        LOG_ERROR("DRM", "  1. No GPU/display driver loaded");
+        LOG_ERROR("DRM", "  2. Running in SSH without display");
+        LOG_ERROR("DRM", "  3. Need to run on the Pi's console directly");
         return NULL;
     }
 
@@ -121,52 +122,52 @@ int drm_init(display_ctx_t *drm) {
     
     // Only block if we're clearly under a graphical session
     if ((display && strlen(display) > 0) || (wayland_display && strlen(wayland_display) > 0)) {
-        fprintf(stderr, "\n=== Cannot Initialize DRM ===\n");
-        fprintf(stderr, "Running under a display server (X11/Wayland).\n");
-        fprintf(stderr, "DISPLAY=%s\n", display ? display : "(not set)");
-        fprintf(stderr, "WAYLAND_DISPLAY=%s\n", wayland_display ? wayland_display : "(not set)");
-        fprintf(stderr, "DRM/KMS requires direct console access.\n\n");
-        fprintf(stderr, "Quick fix:\n");
-        fprintf(stderr, "  1. Switch to console: Ctrl+Alt+F1 (or F2-F6)\n");
-        fprintf(stderr, "  2. Login and run: sudo ./pickle <video>\n");
-        fprintf(stderr, "\nPermanent fix:\n");
-        fprintf(stderr, "  sudo systemctl set-default multi-user.target\n");
-        fprintf(stderr, "  sudo reboot\n");
-        fprintf(stderr, "================================\n\n");
+        LOG_ERROR("DRM", "\n=== Cannot Initialize DRM ===");
+        LOG_ERROR("DRM", "Running under a display server (X11/Wayland).");
+        LOG_ERROR("DRM", "DISPLAY=%s", display ? display : "(not set)");
+        LOG_ERROR("DRM", "WAYLAND_DISPLAY=%s", wayland_display ? wayland_display : "(not set)");
+        LOG_ERROR("DRM", "DRM/KMS requires direct console access.\n");
+        LOG_ERROR("DRM", "Quick fix:");
+        LOG_ERROR("DRM", "  1. Switch to console: Ctrl+Alt+F1 (or F2-F6)");
+        LOG_ERROR("DRM", "  2. Login and run: sudo ./pickle <video>");
+        LOG_ERROR("DRM", "\nPermanent fix:");
+        LOG_ERROR("DRM", "  sudo systemctl set-default multi-user.target");
+        LOG_ERROR("DRM", "  sudo reboot");
+        LOG_ERROR("DRM", "================================\n");
         return -1;
     }
 
     // Open DRM device
     drm->drm_fd = find_drm_device();
     if (drm->drm_fd < 0) {
-        fprintf(stderr, "Failed to open DRM device\n");
-        fprintf(stderr, "Hint: Try running with 'sudo ./pickel <video>' for hardware access\n");
-        fprintf(stderr, "Or make sure you're in the 'video' group: sudo usermod -a -G video $USER\n");
+        LOG_ERROR("DRM", "Failed to open DRM device");
+        LOG_ERROR("DRM", "Hint: Try running with 'sudo ./pickel <video>' for hardware access");
+        LOG_ERROR("DRM", "Or make sure you're in the 'video' group: sudo usermod -a -G video $USER");
         return -1;
     }
 
     // Try to become DRM master
     int master_ret = drmSetMaster(drm->drm_fd);
     if (master_ret != 0) {
-        printf("Warning: Failed to become DRM master: %s\n", strerror(errno));
-        printf("Another process may be controlling the display\n");
+        LOG_WARN("DRM", "Failed to become DRM master: %s", strerror(errno));
+        LOG_WARN("DRM", "Another process may be controlling the display");
         // Continue anyway - might work with render nodes
     } else {
-        printf("Successfully became DRM master\n");
+        LOG_INFO("DRM", "Successfully became DRM master");
     }
 
     // Find connected display
     drm->connector = find_connector(drm);
     if (!drm->connector) {
-        fprintf(stderr, "No connected display found\n");
-        fprintf(stderr, "\nDebugging information:\n");
-        fprintf(stderr, "- Current TTY: %s\n", ttyname(STDIN_FILENO) ? ttyname(STDIN_FILENO) : "unknown");
-        fprintf(stderr, "- Session type: %s\n", getenv("XDG_SESSION_TYPE") ? getenv("XDG_SESSION_TYPE") : "unknown");
-        fprintf(stderr, "- Running via SSH: %s\n", getenv("SSH_CLIENT") ? "yes" : "no");
-        fprintf(stderr, "\nPossible solutions:\n");
-        fprintf(stderr, "1. Run directly on Pi console (not SSH): sudo ./pickel <video>\n");
-        fprintf(stderr, "2. Stop desktop environment: sudo systemctl stop lightdm\n");
-        fprintf(stderr, "3. Switch to console: Ctrl+Alt+F1, then run with sudo\n");
+        LOG_ERROR("DRM", "No connected display found");
+        LOG_ERROR("DRM", "\nDebugging information:");
+        LOG_ERROR("DRM", "- Current TTY: %s", ttyname(STDIN_FILENO) ? ttyname(STDIN_FILENO) : "unknown");
+        LOG_ERROR("DRM", "- Session type: %s", getenv("XDG_SESSION_TYPE") ? getenv("XDG_SESSION_TYPE") : "unknown");
+        LOG_ERROR("DRM", "- Running via SSH: %s", getenv("SSH_CLIENT") ? "yes" : "no");
+        LOG_ERROR("DRM", "\nPossible solutions:");
+        LOG_ERROR("DRM", "1. Run directly on Pi console (not SSH): sudo ./pickel <video>");
+        LOG_ERROR("DRM", "2. Stop desktop environment: sudo systemctl stop lightdm");
+        LOG_ERROR("DRM", "3. Switch to console: Ctrl+Alt+F1, then run with sudo");
         close(drm->drm_fd);
         drm->drm_fd = -1;
         return -1;
@@ -174,7 +175,7 @@ int drm_init(display_ctx_t *drm) {
 
     // Get display mode
     if (drm->connector->count_modes == 0) {
-        fprintf(stderr, "No display modes available\n");
+        LOG_ERROR("DRM", "No display modes available");
         drmModeFreeConnector(drm->connector);
         drm->connector = NULL;
         close(drm->drm_fd);
@@ -186,11 +187,14 @@ int drm_init(display_ctx_t *drm) {
     drm->width = drm->mode.hdisplay;
     drm->height = drm->mode.vdisplay;
     drm->refresh_rate = drm->mode.vrefresh;
+    
+    LOG_INFO("DRM", "Display mode: %dx%d @ %dHz", 
+             drm->width, drm->height, drm->refresh_rate);
 
     // Find encoder
     drm->encoder = find_encoder(drm);
     if (!drm->encoder) {
-        fprintf(stderr, "Failed to find encoder\n");
+        LOG_ERROR("DRM", "Failed to find encoder");
         drmModeFreeConnector(drm->connector);
         drm->connector = NULL;
         close(drm->drm_fd);
@@ -201,7 +205,7 @@ int drm_init(display_ctx_t *drm) {
     // Get CRTC
     drm->crtc = drmModeGetCrtc(drm->drm_fd, drm->encoder->crtc_id);
     if (!drm->crtc) {
-        fprintf(stderr, "Failed to get CRTC\n");
+        LOG_ERROR("DRM", "Failed to get CRTC");
         close(drm->drm_fd);
         drm->drm_fd = -1;
         drm->connector = NULL;
@@ -212,10 +216,10 @@ int drm_init(display_ctx_t *drm) {
     // PRODUCTION: Save original CRTC state for restoration on cleanup
     drm->saved_crtc = drmModeGetCrtc(drm->drm_fd, drm->encoder->crtc_id);
     if (!drm->saved_crtc) {
-        fprintf(stderr, "Warning: Failed to save original CRTC state\n");
+        LOG_WARN("DRM", "Failed to save original CRTC state");
     }
     
-    printf("Using CRTC %d, Encoder %d, Connector %d\n", 
+    LOG_INFO("DRM", "Using CRTC %d, Encoder %d, Connector %d", 
            drm->crtc_id, drm->encoder_id, drm->connector_id);
     
     // Initialize state
@@ -229,7 +233,7 @@ int drm_init(display_ctx_t *drm) {
     // Initialize GBM
     drm->gbm_device = gbm_create_device(drm->drm_fd);
     if (!drm->gbm_device) {
-        fprintf(stderr, "Failed to create GBM device\n");
+        LOG_ERROR("DRM", "Failed to create GBM device");
         drmModeFreeCrtc(drm->crtc);
         drm->crtc = NULL;
         drmModeFreeEncoder(drm->encoder);
@@ -247,7 +251,7 @@ int drm_init(display_ctx_t *drm) {
                                           GBM_FORMAT_XRGB8888,
                                           GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
     if (!drm->gbm_surface) {
-        fprintf(stderr, "Failed to create GBM surface\n");
+        LOG_ERROR("DRM", "Failed to create GBM surface");
         gbm_device_destroy(drm->gbm_device);
         drm->gbm_device = NULL;
         drmModeFreeCrtc(drm->crtc);
@@ -289,7 +293,7 @@ uint32_t drm_get_fb_for_bo(display_ctx_t *drm, struct gbm_bo *bo) {
     int ret = drmModeAddFB(drm->drm_fd, width, height, 24, 32,
                           stride, handle, &fb_id);
     if (ret) {
-        fprintf(stderr, "Failed to create framebuffer: %s\n", strerror(errno));
+        LOG_ERROR("DRM", "Failed to create framebuffer: %s", strerror(errno));
         return 0;
     }
     
@@ -325,18 +329,18 @@ int drm_set_mode(display_ctx_t *drm, uint32_t fb_id) {
     if (ret != 0) {
         // Only show detailed error once
         if (!error_shown) {
-            fprintf(stderr, "Failed to set CRTC mode: %s\n", strerror(errno));
+            LOG_ERROR("DRM", "Failed to set CRTC mode: %s", strerror(errno));
             
             // Provide helpful diagnostics
             if (errno == EACCES || errno == EPERM) {
-                fprintf(stderr, "\n=== DRM Permission Error ===\n");
-                fprintf(stderr, "Another process may be using the display (X11, Wayland, etc.)\n");
-                fprintf(stderr, "Solutions:\n");
-                fprintf(stderr, "  1. Stop display manager: sudo systemctl stop lightdm\n");
-                fprintf(stderr, "  2. Run with sudo: sudo ./pickle <video>\n");
-                fprintf(stderr, "  3. Add to groups: sudo usermod -a -G video,render $USER\n");
-                fprintf(stderr, "     (then logout/login)\n");
-                fprintf(stderr, "============================\n\n");
+                LOG_ERROR("DRM", "\n=== DRM Permission Error ===");
+                LOG_ERROR("DRM", "Another process may be using the display (X11, Wayland, etc.)");
+                LOG_ERROR("DRM", "Solutions:");
+                LOG_ERROR("DRM", "  1. Stop display manager: sudo systemctl stop lightdm");
+                LOG_ERROR("DRM", "  2. Run with sudo: sudo ./pickle <video>");
+                LOG_ERROR("DRM", "  3. Add to groups: sudo usermod -a -G video,render $USER");
+                LOG_ERROR("DRM", "     (then logout/login)");
+                LOG_ERROR("DRM", "============================\n");
             }
             error_shown = true;
         }
@@ -375,26 +379,26 @@ int drm_swap_buffers(display_ctx_t *drm) {
     // Get the front buffer from GBM surface
     drm->next_bo = gbm_surface_lock_front_buffer(drm->gbm_surface);
     if (!drm->next_bo) {
-        fprintf(stderr, "Failed to lock front buffer\n");
+        LOG_ERROR("DRM", "Failed to lock front buffer");
         return -1;
     }
     // Get framebuffer ID for the buffer
     drm->next_fb_id = drm_get_fb_for_bo(drm, drm->next_bo);
     if (!drm->next_fb_id) {
-        fprintf(stderr, "Failed to get framebuffer ID\n");
+        LOG_ERROR("DRM", "Failed to get framebuffer ID");
         gbm_surface_release_buffer(drm->gbm_surface, drm->next_bo);
         return -1;
     }
     
     // First frame: set the mode
     if (!drm->mode_set_done) {
-        printf("Setting display mode...\n");
+        LOG_INFO("DRM", "Setting display mode...");
         int ret = drm_set_mode(drm, drm->next_fb_id);
         if (ret) {
             // Only print error once, then fail gracefully
             static bool error_printed = false;
             if (!error_printed) {
-                printf("DRM: drm_set_mode failed with code %d\n", ret);
+                LOG_ERROR("DRM", "drm_set_mode failed with code %d", ret);
                 error_printed = true;
             }
             gbm_surface_release_buffer(drm->gbm_surface, drm->next_bo);
@@ -402,7 +406,7 @@ int drm_swap_buffers(display_ctx_t *drm) {
         }
         drm->current_bo = drm->next_bo;
         drm->current_fb_id = drm->next_fb_id;
-        printf("Display initialized. Video should appear now.\n");
+        LOG_INFO("DRM", "Display initialized. Video should appear now.");
         return 0;
     }
     
@@ -420,7 +424,7 @@ int drm_swap_buffers(display_ctx_t *drm) {
     int ret = drmModePageFlip(drm->drm_fd, drm->crtc_id, drm->next_fb_id,
                              DRM_MODE_PAGE_FLIP_EVENT, drm);
     if (ret) {
-        fprintf(stderr, "Failed to queue page flip: %s\n", strerror(errno));
+        LOG_ERROR("DRM", "Failed to queue page flip: %s", strerror(errno));
         drm->waiting_for_flip = false;
         gbm_surface_release_buffer(drm->gbm_surface, drm->next_bo);
         // PRODUCTION: Clean up framebuffer on error to prevent resource leak
@@ -448,7 +452,7 @@ void drm_cleanup(display_ctx_t *drm) {
                                  1, 
                                  &drm->saved_crtc->mode);
         if (ret < 0) {
-            fprintf(stderr, "Warning: Failed to restore CRTC state: %d\n", ret);
+            LOG_WARN("DRM", "Failed to restore CRTC state: %d", ret);
         }
         drmModeFreeCrtc(drm->saved_crtc);
         drm->saved_crtc = NULL;

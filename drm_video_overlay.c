@@ -4,6 +4,7 @@
 // This bypasses OpenGL/EGL entirely and uses DRM/KMS direct scanout
 #include "drm_display.h"
 #include "video_decoder.h"
+#include "logging.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,7 +65,7 @@ static void* plane_worker_thread_func(void* arg) {
         // last_present_time = plane_t2;
 
         if (hw_debug_enabled && plane_ms > 5.0) {
-            printf("[KMS-WORKER] drmModeSetPlane took %.1fms (plane=%u, crtc=%u, fb=%u)\n",
+            LOG_DEBUG("KMS-WORKER", "drmModeSetPlane took %.1fms (plane=%u, crtc=%u, fb=%u)",
                    plane_ms, drm->video_plane_id, drm->crtc_id, fb_id);
         }
         
@@ -74,7 +75,7 @@ static void* plane_worker_thread_func(void* arg) {
         if (ret < 0) {
             static int err_count = 0;
             if (err_count < 5 && hw_debug_enabled) {
-                fprintf(stderr, "[KMS-WORKER] drmModeSetPlane failed: %s\n", strerror(errno));
+                LOG_WARN("KMS-WORKER", "drmModeSetPlane failed: %s", strerror(errno));
                 err_count++;
             }
         } else {
@@ -91,14 +92,14 @@ static void* plane_worker_thread_func(void* arg) {
 // Initialize and find an available overlay plane for video
 int drm_init_video_plane(display_ctx_t *drm) {
     if (!drm || drm->drm_fd < 0) {
-        fprintf(stderr, "[KMS] Invalid DRM context\n");
+        LOG_ERROR("KMS", "Invalid DRM context");
         return -1;
     }
     
     // Find CRTC index by looking through resources
     drmModeResPtr resources = drmModeGetResources(drm->drm_fd);
     if (!resources) {
-        fprintf(stderr, "[KMS] Failed to get DRM resources\n");
+        LOG_ERROR("KMS", "Failed to get DRM resources");
         return -1;
     }
     
@@ -112,23 +113,23 @@ int drm_init_video_plane(display_ctx_t *drm) {
     drmModeFreeResources(resources);
     
     if (crtc_index < 0) {
-        fprintf(stderr, "[KMS] Could not find CRTC index for ID %u\n", drm->crtc_id);
+        LOG_ERROR("KMS", "Could not find CRTC index for ID %u", drm->crtc_id);
         return -1;
     }
     
     if (hw_debug_enabled) {
-        printf("[KMS] CRTC ID %u is at index %d\n", drm->crtc_id, crtc_index);
+        LOG_DEBUG("KMS", "CRTC ID %u is at index %d", drm->crtc_id, crtc_index);
     }
     
     // Get all available planes
     drmModePlaneResPtr planes = drmModeGetPlaneResources(drm->drm_fd);
     if (!planes) {
-        fprintf(stderr, "[KMS] Failed to get plane resources: %s\n", strerror(errno));
+        LOG_ERROR("KMS", "Failed to get plane resources: %s", strerror(errno));
         return -1;
     }
     
     if (hw_debug_enabled) {
-        printf("[KMS] Found %d planes total\n", planes->count_planes);
+        LOG_DEBUG("KMS", "Found %d planes total", planes->count_planes);
     }
     
     // Look for an overlay plane that supports YUV420 and our CRTC
@@ -196,7 +197,7 @@ int drm_init_video_plane(display_ctx_t *drm) {
             // Found a suitable overlay plane
             if (is_overlay && plane->crtc_id == 0) {  // Not currently in use
                 if (hw_debug_enabled) {
-                    printf("[KMS] ✓ Found available overlay plane: %u (supports YUV420, compatible with CRTC %d)\n", 
+                    LOG_DEBUG("KMS", "✓ Found available overlay plane: %u (supports YUV420, compatible with CRTC %d)", 
                            plane->plane_id, crtc_index);
                 }
                 drm->video_plane_id = plane->plane_id;
@@ -214,10 +215,10 @@ int drm_init_video_plane(display_ctx_t *drm) {
                 if (pthread_create(&drm->plane_worker_thread, NULL, plane_worker_thread_func, drm) == 0) {
                     drm->plane_worker_running = true;
                     if (hw_debug_enabled) {
-                        printf("[KMS] Worker thread started for non-blocking plane updates\n");
+                        LOG_DEBUG("KMS", "Worker thread started for non-blocking plane updates");
                     }
                 } else {
-                    fprintf(stderr, "[KMS] Warning: Failed to create worker thread, will use blocking updates\n");
+                    LOG_WARN("KMS", "Failed to create worker thread, will use blocking updates");
                 }
                 
                 drmModeFreePlane(plane);
@@ -230,7 +231,7 @@ int drm_init_video_plane(display_ctx_t *drm) {
     }
     
     drmModeFreePlaneResources(planes);
-    fprintf(stderr, "[KMS] No available overlay plane found\n");
+    LOG_ERROR("KMS", "No available overlay plane found");
     return -1;
 }
 
@@ -238,7 +239,7 @@ int drm_init_video_plane(display_ctx_t *drm) {
 int drm_create_video_fb(display_ctx_t *drm, int dma_fd, uint32_t width, uint32_t height,
                         int plane_offsets[3], int plane_pitches[3], uint32_t *fb_id_out) {
     if (!drm || dma_fd < 0 || !fb_id_out) {
-        fprintf(stderr, "[KMS] Invalid parameters for framebuffer creation\n");
+        LOG_ERROR("KMS", "Invalid parameters for framebuffer creation");
         return -1;
     }
     
@@ -264,7 +265,7 @@ int drm_create_video_fb(display_ctx_t *drm, int dma_fd, uint32_t width, uint32_t
     };
     
     if (drmIoctl(drm->drm_fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &prime_handle) < 0) {
-        fprintf(stderr, "[KMS] Failed to import DMA-BUF: %s\n", strerror(errno));
+        LOG_ERROR("KMS", "Failed to import DMA-BUF: %s", strerror(errno));
         return -1;
     }
 
@@ -295,14 +296,14 @@ int drm_create_video_fb(display_ctx_t *drm, int dma_fd, uint32_t width, uint32_t
     double fb_ms = (fb_t2.tv_sec - fb_t1.tv_sec) * 1000.0 +
                    (fb_t2.tv_nsec - fb_t1.tv_nsec) / 1000000.0;
     if ((fb_ms > 5.0 && hw_debug_enabled) || hw_debug_enabled) {
-        printf("[KMS] drmModeAddFB2 took %.1fms (width=%u height=%u)\n", fb_ms, width, height);
+        LOG_DEBUG("KMS", "drmModeAddFB2 took %.1fms (width=%u height=%u)", fb_ms, width, height);
     }
     
     if (ret < 0) {
-        fprintf(stderr, "[KMS] drmModeAddFB2 failed: %s\n", strerror(errno));
-        fprintf(stderr, "[KMS] Format: YUV420, Size: %dx%d\n", width, height);
-        fprintf(stderr, "[KMS] Pitches: %d, %d, %d\n", pitches[0], pitches[1], pitches[2]);
-        fprintf(stderr, "[KMS] Offsets: %d, %d, %d\n", offsets[0], offsets[1], offsets[2]);
+        LOG_ERROR("KMS", "drmModeAddFB2 failed: %s", strerror(errno));
+        LOG_ERROR("KMS", "Format: YUV420, Size: %dx%d", width, height);
+        LOG_ERROR("KMS", "Pitches: %d, %d, %d", pitches[0], pitches[1], pitches[2]);
+        LOG_ERROR("KMS", "Offsets: %d, %d, %d", offsets[0], offsets[1], offsets[2]);
         
         // Clean up GEM handle
         struct drm_gem_close gem_close = { .handle = prime_handle.handle };
@@ -322,7 +323,7 @@ int drm_create_video_fb(display_ctx_t *drm, int dma_fd, uint32_t width, uint32_t
     // Only log first few framebuffer creations
     static int fb_create_count = 0;
     if (fb_create_count < 3 && hw_debug_enabled) {
-        printf("[KMS] ✓ Created framebuffer %d from DMA-BUF (FD=%d, %dx%d) [cached]\n", 
+        LOG_DEBUG("KMS", "✓ Created framebuffer %d from DMA-BUF (FD=%d, %dx%d) [cached]", 
                fb_id, dma_fd, width, height);
         fb_create_count++;
     }
@@ -389,14 +390,14 @@ int drm_display_video_frame(display_ctx_t *drm, uint32_t fb_id, uint32_t x, uint
     double plane_ms = (plane_t2.tv_sec - plane_t1.tv_sec) * 1000.0 +
                       (plane_t2.tv_nsec - plane_t1.tv_nsec) / 1000000.0;
     if ((plane_ms > 5.0 && hw_debug_enabled) || plane_ms > 20.0) {
-        printf("[KMS] drmModeSetPlane took %.1fms (plane=%u, crtc=%u, fb=%u)\n",
+        LOG_DEBUG("KMS", "drmModeSetPlane took %.1fms (plane=%u, crtc=%u, fb=%u)",
                plane_ms, drm->video_plane_id, drm->crtc_id, fb_id);
     }
     
     if (ret < 0) {
         static int err_count = 0;
         if (err_count < 5) {
-            fprintf(stderr, "[KMS] drmModeSetPlane failed: %s (plane=%u, crtc=%u, fb=%u, pos=%u,%u, size=%ux%u)\n", 
+            LOG_ERROR("KMS", "drmModeSetPlane failed: %s (plane=%u, crtc=%u, fb=%u, pos=%u,%u, size=%ux%u)", 
                    strerror(errno), drm->video_plane_id, drm->crtc_id, fb_id, x, y, width, height);
             err_count++;
         }
@@ -444,7 +445,7 @@ void drm_hide_video_plane(display_ctx_t *drm) {
         drm->plane_worker_running = false;
 
         if (hw_debug_enabled) {
-            printf("[KMS] Worker thread stopped\n");
+            LOG_DEBUG("KMS", "Worker thread stopped");
         }
     }
     

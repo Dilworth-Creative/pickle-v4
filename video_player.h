@@ -54,7 +54,7 @@ typedef struct {
 } app_context_t;
 
 // Main application functions
-int app_init(app_context_t *app, const char *video_file, const char *video_file2, bool loop_playback, bool show_timing, bool debug_gamepad, bool advanced_diagnostics, bool enable_hardware_decode);
+int app_init(app_context_t *app, const char *video_file, const char *video_file2, bool loop_playback, bool show_timing, bool debug_gamepad, bool advanced_diagnostics, bool enable_hardware_decode, bool dual_hw_decode);
 void app_run(app_context_t *app);
 void app_cleanup(app_context_t *app);
 

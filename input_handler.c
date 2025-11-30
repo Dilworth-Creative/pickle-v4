@@ -1,4 +1,5 @@
 #include "input_handler.h"
+#include "logging.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,8 +21,8 @@
 #define test_bit(bit, array) ((array[LONG(bit)] >> OFF(bit)) & 1)
 
 // Global terminal state for emergency restoration
-static struct termios g_orig_termios;
-static struct termios g_original_term;  // Alternative name for compatibility
+// PRODUCTION: Consolidated to single global (was duplicated as g_orig_termios and g_original_term)
+static struct termios g_original_term;
 static bool g_terminal_modified = false;
 static int g_stdin_fd = -1;
 
@@ -84,7 +85,7 @@ static int find_keyboard_device(void) {
     // Try to find a keyboard device by checking input devices
     DIR *dir = opendir("/dev/input");
     if (!dir) {
-        fprintf(stderr, "Failed to open /dev/input directory\n");
+        LOG_ERROR("INPUT", "Failed to open /dev/input directory");
         return -1;
     }
     
@@ -109,7 +110,7 @@ static int find_keyboard_device(void) {
                 // Look for keyboard-related keywords in device name
                 if (strstr(name, "keyboard") || strstr(name, "Keyboard") ||
                     strstr(name, "USB") || strstr(name, "AT")) {
-                    printf("Found keyboard device: %s (%s)\n", device_path, name);
+                    LOG_INFO("INPUT", "Found keyboard device: %s (%s)", device_path, name);
                     break;
                 }
                 
@@ -149,7 +150,7 @@ static int find_gamepad_device(void) {
     char name[256] = "Unknown";
     ioctl(fd, JSIOCGNAME(sizeof(name)), name);
     
-    printf("Found gamepad device: %s (%s)\n", device, name);
+    LOG_INFO("INPUT", "Found gamepad device: %s (%s)", device, name);
     return fd;
 }
 
@@ -158,7 +159,7 @@ static int setup_terminal_input(input_context_t *input) {
     
     // Check if stdin is a terminal (tty)
     if (!isatty(input->stdin_fd)) {
-        printf("Input is not a terminal, using simplified input mode\n");
+        LOG_INFO("INPUT", "Input is not a terminal, using simplified input mode");
         // For non-tty input (pipes, redirects), just use stdin directly
         return 0;
     }
@@ -169,8 +170,7 @@ static int setup_terminal_input(input_context_t *input) {
     }
     
     // Save global copy for emergency restoration
-    g_orig_termios = input->orig_termios;
-    g_original_term = input->orig_termios;  // Save for comprehensive restore function
+    g_original_term = input->orig_termios;
     g_stdin_fd = input->stdin_fd;
     g_terminal_modified = true;
     
@@ -187,8 +187,8 @@ static int setup_terminal_input(input_context_t *input) {
     // Mark that we modified the terminal
     g_terminal_modified = true;
     
-    printf("Using terminal input mode (press keys directly)\n");
-    printf("Controls: 1-4=select corner, arrows=move, s=save, r=reset, c=corners, b=border, h=help, q=quit\n");
+    LOG_INFO("INPUT", "Using terminal input mode (press keys directly)");
+    LOG_INFO("INPUT", "Controls: 1-4=select corner, arrows=move, s=save, r=reset, c=corners, b=border, h=help, q=quit");
     fflush(stdout);
     return 0;
 }
@@ -198,11 +198,22 @@ void input_restore_terminal_global(void) {
     restore_terminal_state();
     
     // Additional safety measures for terminal restoration
-    printf("\nTerminal restored\n");
+    LOG_INFO("INPUT", "Terminal restored");
     fflush(stdout);
     
-    // Force terminal to reset to a known good state
-    system("stty sane 2>/dev/null || true");
+    // PRODUCTION FIX: Use direct termios API instead of system() for security
+    // system() is a security risk if running with elevated privileges
+    // Just restore the original terminal settings we saved at startup
+    if (g_terminal_modified) {
+        struct termios sane_term = g_original_term;
+        // Ensure canonical and echo modes are re-enabled
+        sane_term.c_lflag |= (ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN);
+        sane_term.c_iflag |= (ICRNL | IXON);
+        sane_term.c_oflag |= (OPOST | ONLCR);
+        sane_term.c_cc[VMIN] = 1;
+        sane_term.c_cc[VTIME] = 0;
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &sane_term);
+    }
 }
 
 static void restore_terminal(input_context_t *input) {
@@ -226,29 +237,29 @@ int input_init(input_context_t *input) {
                           (!isatty(STDIN_FILENO));
     
     if (prefer_terminal) {
-        printf("Terminal environment detected, using terminal input...\n");
+        LOG_INFO("INPUT", "Terminal environment detected, using terminal input...");
         if (setup_terminal_input(input) == 0) {
             input->use_stdin_fallback = true;
             input->keyboard_fd = -1;
         } else {
-            fprintf(stderr, "Failed to set up terminal input\n");
+            LOG_ERROR("INPUT", "Failed to set up terminal input");
             return -1;
         }
     } else {
         input->keyboard_fd = find_keyboard_device();
         if (input->keyboard_fd < 0) {
-            printf("Event device input not available, trying terminal input...\n");
+            LOG_INFO("INPUT", "Event device input not available, trying terminal input...");
             
             // Try terminal input as fallback
             if (setup_terminal_input(input) == 0) {
                 input->use_stdin_fallback = true;
                 input->keyboard_fd = -1; // Mark event device as unavailable
             } else {
-                fprintf(stderr, "Failed to set up any input method\n");
+                LOG_ERROR("INPUT", "Failed to set up any input method");
                 return -1;
             }
         } else {
-            printf("Using event device input\n");
+            LOG_INFO("INPUT", "Using event device input");
             input->use_stdin_fallback = false;
         }
     }
@@ -259,11 +270,11 @@ int input_init(input_context_t *input) {
     input->gamepad_fd = find_gamepad_device();
     if (input->gamepad_fd >= 0) {
         input->gamepad_enabled = true;
-        printf("Gamepad input enabled\n");
+        LOG_INFO("INPUT", "Gamepad input enabled");
     } else {
         input->gamepad_enabled = false;
         input->gamepad_fd = -1;
-        printf("No gamepad detected (keyboard/terminal input only)\n");
+        LOG_INFO("INPUT", "No gamepad detected (keyboard/terminal input only)");
     }
     
     // Input handler initialization complete
@@ -279,7 +290,7 @@ static bool try_connect_gamepad(input_context_t *input) {
     input->gamepad_fd = find_gamepad_device();
     if (input->gamepad_fd >= 0) {
         input->gamepad_enabled = true;
-        printf("Gamepad connected!\n");
+        LOG_INFO("INPUT", "Gamepad connected!");
         return true;
     }
     return false;
@@ -339,7 +350,7 @@ void input_update(input_context_t *input) {
                 case 'q':
                 case 'Q':
                     input->should_quit = true;
-                    printf("Quit requested\n");
+                    LOG_DEBUG("INPUT", "Quit requested");
                     break;
                 case 27: // ESC - check for arrow key sequences
                     {
@@ -371,18 +382,18 @@ void input_update(input_context_t *input) {
                                     default:
                                         // Unknown escape sequence, treat as quit
                                         input->should_quit = true;
-                                        printf("Quit requested (ESC)\n");
+                                        LOG_DEBUG("INPUT", "Quit requested (ESC)");
                                         break;
                                 }
                             } else {
                                 // Just ESC by itself
                                 input->should_quit = true;
-                                printf("Quit requested (ESC)\n");
+                                LOG_DEBUG("INPUT", "Quit requested (ESC)");
                             }
                         } else {
                             // Just ESC by itself
                             input->should_quit = true;
-                            printf("Quit requested (ESC)\n");
+                            LOG_DEBUG("INPUT", "Quit requested (ESC)");
                         }
                     }
                     break;

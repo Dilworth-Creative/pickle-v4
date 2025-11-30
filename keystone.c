@@ -1,13 +1,16 @@
 #include "keystone.h"
+#include "logging.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
-// Allow keystone quads to shrink dramatically while still rejecting
-// truly degenerate (near-zero area) configurations.
-#define KEYSTONE_MIN_AREA_MOVE   0.001f  // ~0.025% of full quad
-#define KEYSTONE_MIN_AREA_MATRIX 0.0005f // Keep solver guard slightly tighter
+// Minimum area thresholds to prevent degenerate perspective transformations
+// Keystone corners define a quad in normalized coordinates (-1 to 1, area = 4)
+// MOVE: 0.001 = 0.025% of full quad - allows dramatic shrinking during user adjustment
+// MATRIX: 0.0005 = 0.0125% of full quad - stricter guard for matrix solver stability
+#define KEYSTONE_MIN_AREA_MOVE   0.001f
+#define KEYSTONE_MIN_AREA_MATRIX 0.0005f
 
 // Matrix math utilities for perspective transformation
 static void matrix_identity(float *matrix) {
@@ -334,7 +337,7 @@ void keystone_increase_step_size(keystone_context_t *keystone) {
     if (keystone->move_step > 0.01f) {
         keystone->move_step = 0.01f; // Max step size
     }
-    printf("Keystone step size: %.4f\n", keystone->move_step);
+    LOG_DEBUG("KEYSTONE", "Step size: %.4f", keystone->move_step);
 }
 
 void keystone_decrease_step_size(keystone_context_t *keystone) {
@@ -343,7 +346,7 @@ void keystone_decrease_step_size(keystone_context_t *keystone) {
     if (keystone->move_step < 0.0001f) {
         keystone->move_step = 0.0001f; // Min step size
     }
-    printf("Keystone step size: %.4f\n", keystone->move_step);
+    LOG_DEBUG("KEYSTONE", "Step size: %.4f", keystone->move_step);
 }
 
 float keystone_get_step_size(keystone_context_t *keystone) {
@@ -431,7 +434,7 @@ int keystone_load_settings(keystone_context_t *keystone) {
     const char *filename = "pickle_keystone.conf";
     if (keystone_load_from_file(keystone, filename) != 0) {
         // No config file found - create one with reset/default values
-        printf("No keystone config found, creating default pickle_keystone.conf\n");
+        LOG_INFO("KEYSTONE", "No config found, creating default pickle_keystone.conf");
 
         // Reset to default corner positions
         keystone_reset_corners(keystone);
@@ -443,10 +446,10 @@ int keystone_load_settings(keystone_context_t *keystone) {
 
         // Save the default config
         if (keystone_save_to_file(keystone, filename) == 0) {
-            printf("Created default pickle_keystone.conf with reset corner positions\n");
+            LOG_INFO("KEYSTONE", "Created default pickle_keystone.conf with reset corner positions");
             return 0;
         } else {
-            printf("Warning: Failed to create default config file\n");
+            LOG_WARN("KEYSTONE", "Failed to create default config file");
             return -1;
         }
     }

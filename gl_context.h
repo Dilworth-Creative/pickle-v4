@@ -32,15 +32,7 @@ typedef struct {
     GLuint texture_y2;    // Y plane texture (video 2)
     GLuint texture_u2;    // U plane texture (video 2)
     GLuint texture_v2;    // V plane texture (video 2)
-    
-    // Pixel Buffer Objects for async texture staging
-    GLuint pbo[2][3];     // Double-buffered PBOs per Y/U/V plane
-    GLsync pbo_fences[2]; // Fences for PBO synchronization
-    size_t pbo_size[3];   // Allocated bytes per plane
-    int pbo_index;        // Current staging buffer slot
-    bool use_pbo;         // Enable PBO async uploads
-    bool pbo_warned;      // Prevent repeated fallback logs
-    
+
     GLuint vbo;
     GLuint ebo;
     GLuint vao;
@@ -126,7 +118,8 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
                         struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index);
 
 // DMA buffer zero-copy rendering (multi-plane YUV EGLImage with external texture)
-void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int height,
+// Returns true if successful, false if EGLImage import failed (use CPU fallback)
+bool gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int height,
                               int plane_offsets[3], int plane_pitches[3],
                               struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index);
 

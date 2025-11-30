@@ -1,4 +1,5 @@
 #include "v4l2_utils.h"
+#include "logging.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +16,7 @@ int avcc_extradata_to_annexb(const uint8_t *avcc, size_t avcc_len,
                              uint8_t **out_buf, size_t *out_len)
 {
     if (!avcc || avcc_len < 7 || avcc[0] != 1) {
-        printf("V4L2 Utils: Invalid avcC extradata (len=%zu, version=%d)\n", avcc_len, avcc ? avcc[0] : -1);
+        LOG_ERROR("V4L2", "Invalid avcC extradata (len=%zu, version=%d)", avcc_len, avcc ? avcc[0] : -1);
         return -1; // Not avcC format
     }
     
@@ -27,7 +28,7 @@ int avcc_extradata_to_annexb(const uint8_t *avcc, size_t avcc_len,
     
     // Read lengthSizeMinusOne (byte 4, lower 2 bits)
     uint8_t lengthSizeMinusOne = p[4] & 0x03;
-    printf("V4L2 Utils: avcC length size: %d bytes\n", lengthSizeMinusOne + 1);
+    LOG_DEBUG("V4L2", "avcC length size: %d bytes", lengthSizeMinusOne + 1);
     
     // Read number of SPS (byte 5, lower 5 bits)
     uint8_t numSPS = p[5] & 0x1f;
@@ -36,12 +37,12 @@ int avcc_extradata_to_annexb(const uint8_t *avcc, size_t avcc_len,
     size_t total_size = 0;
     uint8_t *buf = NULL;
 
-    printf("V4L2 Utils: Processing %d SPS units\n", numSPS);
+    LOG_DEBUG("V4L2", "Processing %d SPS units", numSPS);
     
     // Process SPS units
     for (uint8_t i = 0; i < numSPS; ++i) {
         if (pos + 2 > avcc_len) {
-            printf("V4L2 Utils: SPS length out of bounds\n");
+            LOG_ERROR("V4L2", "SPS length out of bounds");
             free(buf);
             return -1;
         }
@@ -50,19 +51,19 @@ int avcc_extradata_to_annexb(const uint8_t *avcc, size_t avcc_len,
         pos += 2;
         
         if (pos + sps_len > avcc_len) {
-            printf("V4L2 Utils: SPS data out of bounds\n");
+            LOG_ERROR("V4L2", "SPS data out of bounds");
             free(buf);
             return -1;
         }
         
-        printf("V4L2 Utils: SPS %d length: %d bytes\n", i, sps_len);
+        LOG_DEBUG("V4L2", "SPS %d length: %d bytes", i, sps_len);
         
         // Allocate space for start code + SPS data
         size_t old_size = total_size;
         total_size += 4 + sps_len;
         buf = realloc(buf, total_size);
         if (!buf) {
-            printf("V4L2 Utils: Memory allocation failed\n");
+            LOG_ERROR("V4L2", "Memory allocation failed");
             return -1;
         }
         
@@ -74,18 +75,18 @@ int avcc_extradata_to_annexb(const uint8_t *avcc, size_t avcc_len,
     
     // Read number of PPS 
     if (pos + 1 > avcc_len) {
-        printf("V4L2 Utils: PPS count out of bounds\n");
+        LOG_ERROR("V4L2", "PPS count out of bounds");
         free(buf);
         return -1;
     }
     uint8_t numPPS = p[pos++];
 
-    printf("V4L2 Utils: Processing %d PPS units\n", numPPS);
+    LOG_DEBUG("V4L2", "Processing %d PPS units", numPPS);
     
     // Process PPS units
     for (uint8_t i = 0; i < numPPS; ++i) {
         if (pos + 2 > avcc_len) {
-            printf("V4L2 Utils: PPS length out of bounds\n");
+            LOG_ERROR("V4L2", "PPS length out of bounds");
             free(buf);
             return -1;
         }
@@ -94,19 +95,19 @@ int avcc_extradata_to_annexb(const uint8_t *avcc, size_t avcc_len,
         pos += 2;
         
         if (pos + pps_len > avcc_len) {
-            printf("V4L2 Utils: PPS data out of bounds\n");
+            LOG_ERROR("V4L2", "PPS data out of bounds");
             free(buf);
             return -1;
         }
         
-        printf("V4L2 Utils: PPS %d length: %d bytes\n", i, pps_len);
+        LOG_DEBUG("V4L2", "PPS %d length: %d bytes", i, pps_len);
         
         // Allocate space for start code + PPS data
         size_t old_size = total_size;
         total_size += 4 + pps_len;
         buf = realloc(buf, total_size);
         if (!buf) {
-            printf("V4L2 Utils: Memory allocation failed\n");
+            LOG_ERROR("V4L2", "Memory allocation failed");
             return -1;
         }
         
@@ -119,7 +120,7 @@ int avcc_extradata_to_annexb(const uint8_t *avcc, size_t avcc_len,
     *out_buf = buf;
     *out_len = total_size;
     
-    printf("V4L2 Utils: Converted avcC to Annex-B: %zu bytes\n", total_size);
+    LOG_DEBUG("V4L2", "Converted avcC to Annex-B: %zu bytes", total_size);
     return 0;
 }
 
@@ -143,7 +144,7 @@ int convert_sample_avcc_to_annexb_inplace(uint8_t *sample, size_t sample_len, in
         
         // Check bounds
         if (read_pos + nal_size > sample_len) {
-            printf("V4L2 Utils: NAL unit size %u exceeds buffer bounds\n", nal_size);
+            LOG_ERROR("V4L2", "NAL unit size %u exceeds buffer bounds", nal_size);
             return -1;
         }
         
@@ -189,12 +190,12 @@ int check_v4l2_decoder_capabilities(void)
     char line[1024];
     int found_decoder = 0;
     
-    printf("\n===== V4L2 Hardware Decoder Capabilities =====\n");
+    LOG_INFO("V4L2", "\n===== V4L2 Hardware Decoder Capabilities =====");
     
     // Run v4l2-ctl to get device list
     fp = popen("v4l2-ctl --list-devices 2>/dev/null", "r");
     if (!fp) {
-        printf("Failed to run v4l2-ctl. Make sure it's installed.\n");
+        LOG_ERROR("V4L2", "Failed to run v4l2-ctl. Make sure it's installed.");
         return -1;
     }
     
@@ -203,7 +204,7 @@ int check_v4l2_decoder_capabilities(void)
     while (fgets(line, sizeof(line), fp)) {
         if (strstr(line, "mem2mem") || strstr(line, "stateless") || strstr(line, "codec")) {
             in_mem2mem = true;
-            printf("Potential hardware codec found: %s", line);
+            LOG_INFO("V4L2", "Potential hardware codec found: %s", line);
         } else if (in_mem2mem && line[0] == '\t') {
             // This is a device path under a mem2mem device
             char *device_path = line;
@@ -217,7 +218,7 @@ int check_v4l2_decoder_capabilities(void)
                 device_path[len-1] = '\0';
             }
             
-            printf("Device path: %s\n", device_path);
+            LOG_INFO("V4L2", "Device path: %s", device_path);
             
             // Save path for further inspection
             snprintf(path, sizeof(path), "%s", device_path);
@@ -233,11 +234,11 @@ int check_v4l2_decoder_capabilities(void)
         
         // Check for codec capabilities
         snprintf(cmd, sizeof(cmd), "v4l2-ctl --device=%s --list-formats 2>/dev/null", path);
-        printf("\nChecking codec capabilities for %s:\n", path);
+        LOG_INFO("V4L2", "\nChecking codec capabilities for %s:", path);
         fp = popen(cmd, "r");
         if (fp) {
             while (fgets(line, sizeof(line), fp)) {
-                printf("%s", line);
+                LOG_INFO("V4L2", "%s", line);
                 if (strstr(line, "H264") || strstr(line, "h264")) {
                     found_decoder = 1;
                 }
@@ -247,21 +248,21 @@ int check_v4l2_decoder_capabilities(void)
         
         // Check for m2m capabilities
         snprintf(cmd, sizeof(cmd), "v4l2-ctl --device=%s --all 2>/dev/null | grep -i -e caps -e flags -e codec -e h264 -e hevc", path);
-        printf("\nAdditional codec details:\n");
+        LOG_INFO("V4L2", "\nAdditional codec details:");
         system(cmd);
     } else {
-        printf("No V4L2 hardware decoder devices found\n");
+        LOG_WARN("V4L2", "No V4L2 hardware decoder devices found");
     }
     
     // Additional diagnostics for V4L2 hardware acceleration
-    printf("\nFFmpeg hardware acceleration support:\n");
+    LOG_INFO("V4L2", "\nFFmpeg hardware acceleration support:");
     system("ffmpeg -hide_banner -hwaccels 2>/dev/null | grep -i v4l2 || echo 'No V4L2 hardware acceleration in FFmpeg'");
     
     // Check for available V4L2 codecs in FFmpeg
-    printf("\nFFmpeg V4L2 codecs:\n");
+    LOG_INFO("V4L2", "\nFFmpeg V4L2 codecs:");
     system("ffmpeg -hide_banner -encoders 2>/dev/null | grep -i v4l2");
     system("ffmpeg -hide_banner -decoders 2>/dev/null | grep -i v4l2");
     
-    printf("===============================================\n\n");
+    LOG_INFO("V4L2", "===============================================\n");
     return found_decoder;
 }

@@ -28,6 +28,7 @@
 *.x86_64
 *.hex
 pickle
+pickle3
 
 # Debug files
 *.dSYM/

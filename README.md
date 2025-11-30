@@ -1,104 +1,85 @@
 # Pickle Video Player
 
-**Version:** 4.2.0 (fast-hw)
+**Version:** 1.1.0 (main)
 
-A high-performance dual-video player with hardware-accelerated decoding, OpenGL ES rendering, and real-time keystone correction.
+A high-performance dual-video player designed for embedded Linux systems. Features hardware-accelerated decoding, OpenGL ES rendering via DRM/KMS, and real-time keystone correction for projection mapping applications.
+
+## Target Platform
+
+**Raspberry Pi 4 (2GB model)** - Optimized for low-memory embedded deployment.
+
+### Memory Usage
+| Resolution | Per-Video Buffers | Dual Video Total |
+|------------|------------------|------------------|
+| 1080p      | ~15-25 MB        | ~40-60 MB        |
+| 4K         | ~60-100 MB       | ~140-220 MB      |
+
+**Recommendation:** Use 1080p content for reliable dual-video playback on 2GB systems. 4K is supported but may cause memory pressure under heavy system load.
 
 ## Features
 
 - **Dual video playback** with independent keystone correction for each stream
 - **Hardware decode support** via V4L2 M2M (use `--hw` flag)
-- **Software decode optimized** with direct YUV420P upload (default)
-- **DRM/KMS** direct scanout with OpenGL ES 3.1 rendering
+- **Optimized software decode** with direct YUV420P texture upload (default)
+- **DRM/KMS direct scanout** using OpenGL ES 3.1 rendering
 - **Gamepad and keyboard** input support for interactive control
 - **Real-time profiling** with `--timing` flag
-- **Persistent keystone settings** saved per video configuration
+- **Persistent keystone settings** automatically saved per video configuration
 
-## Version Information
+## Quick Start
 
-Check the current version:
+### Build
 ```bash
+# Install dependencies (Debian/Ubuntu)
+sudo apt install libavcodec-dev libavformat-dev libavutil-dev libdrm-dev libgbm-dev libgles2-mesa-dev
+
+# Compile
+make clean
+make
+```
+
+### Usage
+```bash
+# Single video
+./pickle /path/to/video.mp4
+
+# Dual video playback
+./pickle /path/to/left.mp4 /path/to/right.mp4
+
+# With hardware decoding
+./pickle --hw /path/to/video.mp4
+
+# Check version
 ./pickle --version
-# or
-./pickle -v
 ```
 
-**Semantic Versioning:** To bump the version, edit `version.h`:
-- `VERSION_MAJOR`: Incompatible changes
-- `VERSION_MINOR`: New features (backward-compatible)
-- `VERSION_PATCH`: Bug fixes (backward-compatible)
+## Performance Optimization
 
-## Performance Optimization: CPU Governor Configuration
+**Critical:** Set CPU governor to performance mode to prevent stuttering from frequency scaling.
 
-For optimal video playback performance, especially to eliminate stuttering and periodic frame drops, it's crucial to configure the CPU governor properly.
-
-### The Problem
-
-By default, many Linux systems use the "ondemand" CPU governor, which dynamically scales CPU frequency based on load. This can cause periodic performance spikes (100-140ms delays) during video playback when the CPU frequency scales down during lighter processing periods and then needs to ramp back up.
-
-### Solution: Performance Mode
-
-Set the CPU governor to "performance" mode to maintain consistent maximum CPU frequency during video playback.
-
-## Quick Setup
-
-### 1. Check Current CPU Governor
-```bash
-cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
-```
-
-### 2. Check Available Governors
-```bash
-cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors
-```
-
-### 3. Set Performance Mode (Temporary)
+### Quick Fix (Temporary)
 ```bash
 sudo sh -c 'echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor'
 ```
 
-### 4. Verify the Change
+### Verify
 ```bash
-# Check governor is set
 cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-
-# Check CPU frequencies (should show max frequency)
-cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq
+# Should show 'performance' for all cores
 ```
 
-### 5. Run Video Player
+### Permanent Configuration
+
+**Method 1: cpufrequtils**
 ```bash
-./pickle /path/to/your/video.mp4
-```
-
-## Permanent Configuration (Optional)
-
-To make the performance governor persistent across reboots:
-
-### Method 1: Using cpufrequtils
-```bash
-# Install cpufrequtils
-sudo apt update
 sudo apt install cpufrequtils
-
-# Edit configuration
-sudo nano /etc/default/cpufrequtils
-
-# Add this line:
-GOVERNOR="performance"
-
-# Restart service
+# Add to /etc/default/cpufrequtils: GOVERNOR="performance"
 sudo systemctl restart cpufrequtils
 ```
 
-### Method 2: Using systemd service
-Create a systemd service to set the governor on boot:
+**Method 2: systemd service**
 
-```bash
-sudo nano /etc/systemd/system/cpu-performance.service
-```
-
-Add this content:
+Create `/etc/systemd/system/cpu-performance.service`:
 ```ini
 [Unit]
 Description=Set CPU Governor to Performance
@@ -113,63 +94,35 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 ```
 
-Enable the service:
+Enable with:
 ```bash
-sudo systemctl enable cpu-performance.service
-sudo systemctl start cpu-performance.service
+sudo systemctl enable --now cpu-performance.service
 ```
 
-## Performance Results
+## Versioning
 
-With the CPU governor set to performance mode, you should see:
-
-- **Consistent frame times**: 3-6ms total frame processing
-- **Stable rendering**: GL operations in 2.9-3.3ms range
-- **Smooth playback**: No periodic 100-140ms spikes
-- **Optimal decode times**: 0.6-1.4ms average decode performance
-
-## Reverting to Default
-
-To restore the default "ondemand" governor:
-
-```bash
-sudo sh -c 'echo ondemand | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor'
-```
-
-## Build Instructions
-
-```bash
-# Compile the video player
-make clean
-make
-
-# Run with a video file
-./pickle /path/to/video.mp4
-```
-
-## System Requirements
-
-- Linux with V4L2 M2M hardware decoding support
-- OpenGL ES 3.1
-- DRM/KMS display support
-- FFmpeg libraries (libavformat, libavcodec, libavutil)
+Edit `version.h` to bump versions following semantic versioning:
+- `VERSION_MAJOR`: Incompatible changes
+- `VERSION_MINOR`: New features (backward-compatible)
+- `VERSION_PATCH`: Bug fixes (backward-compatible)
 
 ## Troubleshooting
 
-### Video Stuttering
-1. First, check if CPU governor is set to performance mode
-2. Verify CPU frequencies are at maximum
-3. Check for thermal throttling: `cat /sys/class/thermal/thermal_zone*/temp`
+- **Stuttering/Spikes:** Check CPU governor and thermal throttling (`cat /sys/class/thermal/thermal_zone*/temp`)
+- **Hardware decode fails:** Player auto-falls back to software. Check `dmesg` for V4L2 errors
+- **Display issues:** Ensure user is in `video` and `render` groups for DRM/KMS access
 
-### Hardware Decoding Issues
-The player automatically falls back to software decoding if hardware acceleration fails.
+## Performance Results
 
-### Display Issues
-Ensure you have proper DRM/KMS permissions and are running as root or with appropriate group membership.
+With performance governor enabled:
+- Consistent 3-6ms frame times
+- GL operations: 2.9-3.3ms
+- Decode times: 0.6-1.4ms average
+- No periodic 100-140ms spikes
 
 ---
 
-*Note: This configuration prioritizes performance over power efficiency. Consider reverting to "ondemand" when not using video applications to save battery life on laptops.*
+*Note: Performance mode increases power consumption. Revert to "ondemand" on battery devices when not in use.*
 
 
 

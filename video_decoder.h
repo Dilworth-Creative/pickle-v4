@@ -129,7 +129,6 @@ void video_set_loop(video_context_t *video, bool loop);
 bool video_has_dma_buffer(video_context_t *video);
 int video_get_dma_fd(video_context_t *video);
 void video_get_dma_plane_layout(video_context_t *video, int offsets[3], int pitches[3]);
-int video_get_dma_fd(video_context_t *video);
 int video_get_dma_offset(video_context_t *video);
 size_t video_get_dma_size(video_context_t *video);
 
