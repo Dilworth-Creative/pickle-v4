@@ -741,17 +741,29 @@ void app_run(app_context_t *app) {
         target_frame_time2 = 1.0 / 60.0;
         LOG_WARN("APP", "Video 2 FPS unknown, using display refresh rate (60Hz fallback)");
     }
-    
-    // FIXED: VSync handles frame timing - no manual budgets needed
 
-    // Video 1 frame presentation timing for pacing
-    // At 60Hz display with 60fps video, VSync handles pacing naturally
-    // At higher refresh rates (120Hz+), this ensures we don't consume faster than video FPS
-    double last_frame_present_time = 0.0;
+    // CRITICAL: For dual video, loop must pace at the FASTER of the two frame rates
+    // This ensures both videos can play at their native speed
+    // Example: 30fps + 60fps videos -> loop at 60fps, video1 holds frames naturally
+    double loop_frame_time = target_frame_time;
+    if (app->video2 && target_frame_time2 > 0) {
+        // Use minimum frame time (fastest FPS) for loop pacing
+        loop_frame_time = (target_frame_time2 < target_frame_time) ? target_frame_time2 : target_frame_time;
+        LOG_INFO("APP", "Dual video mode: Loop pacing at %.2f FPS (%.3fms frame time)",
+                 1.0 / loop_frame_time, loop_frame_time * 1000);
+    }
 
-    // Video 2 frame presentation timing for independent pacing
-    // Each video plays at its own native FPS, no synchronization needed
-    double last_frame_present_time2 = 0.0;
+    // FIXED: Loop paces at faster video's FPS, each video independently checks timing
+    // Video-specific timing ensures each plays at its own native FPS
+
+    // Main loop starting - capture startup time for frame timing
+    struct timespec loop_start_time;
+    clock_gettime(CLOCK_MONOTONIC, &loop_start_time);
+    double startup_time = (double)loop_start_time.tv_sec + loop_start_time.tv_nsec / 1e9;
+
+    // Per-video frame consumption timing (independent for each video)
+    double last_frame_present_time = startup_time;   // Video 1 last frame time
+    double last_frame_present_time2 = startup_time;  // Video 2 last frame time
 
     // Frame timing diagnostics
     // Timing measurement variables (render_start/render_end now local to render section)
@@ -818,7 +830,6 @@ void app_run(app_context_t *app) {
     }
 
     // Main loop starting
-    double startup_time = (double)last_time.tv_sec + last_time.tv_nsec / 1e9;
     bool first_decode_attempted = false;
     bool primary_async_requested = false;
     bool primary_async_request_pending = false;
@@ -1139,12 +1150,11 @@ void app_run(app_context_t *app) {
             // Update timing for diagnostics
             last_time = current_time;
 
-            // Frame pacing: Check if enough time has passed since last frame consumption
-            // This ensures correct playback speed at any display refresh rate
+            // FIXED: Loop paces at faster FPS, each video checks its own timing independently
             clock_gettime(CLOCK_MONOTONIC, &current_time);
             double current_total_time = (double)current_time.tv_sec + current_time.tv_nsec / 1e9;
-            
-            // Video 1: Should we consume the next frame?
+
+            // Video 1: Check if enough time passed for this video's FPS
             bool should_consume_v1 = (current_total_time - last_frame_present_time >= target_frame_time);
 
             if (using_async_primary) {
@@ -1162,9 +1172,9 @@ void app_run(app_context_t *app) {
                     primary_async_requested = true;
                 }
 
-                // Only try to consume if timing says we need a new frame
-                // This prevents consuming frames faster than the video's native FPS
-                if (should_consume_v1 && async_decode_wait_frame(app->async_decoder_primary, wait_timeout_ms)) {
+                // CRITICAL: Always check for decoded frames (don't gate on timing)
+                // This allows decoder to stay ahead and frames to be ready when needed
+                if (async_decode_wait_frame(app->async_decoder_primary, wait_timeout_ms)) {
                     // Check for new frame: either YUV data (SW/fallback) or DMA buffer (pure HW)
                     bool frame_available = false;
 
@@ -1182,14 +1192,14 @@ void app_run(app_context_t *app) {
                         }
                     }
 
-                    if (frame_available) {
+                    // Frame is available - but only CONSUME if timing allows
+                    if (frame_available && should_consume_v1) {
                         last_video_data = video_data;
                         frame_count++;
-                        
-                        // Update last_frame_present_time when we consume a frame
-                        // This ensures correct timing at any display refresh rate
+
+                        // Update timing for this video
                         last_frame_present_time = current_total_time;
-                        
+
                         // Mark frame ready for render
                         new_primary_frame_ready = true;
 
@@ -1199,10 +1209,17 @@ void app_run(app_context_t *app) {
                         }
 
                         diagnostic_frame_count++;
-                    }
 
-                    primary_async_requested = false;
-                    primary_async_request_pending = !video_is_eof(app->video);
+                        // Request next frame immediately after consuming
+                        primary_async_requested = false;
+                        primary_async_request_pending = !video_is_eof(app->video);
+                    } else if (frame_available && !should_consume_v1) {
+                        // Frame ready but timing says don't consume yet - hold it
+                        // Don't request next frame, decoder can rest
+                    } else {
+                        // No frame available yet - request one
+                        primary_async_requested = false;
+                    }
                 }
                 // Note: No yield here - V2 decode runs on separate thread (cores 2-3)
                 // Main thread should process V2 frames as fast as possible
@@ -1232,10 +1249,11 @@ void app_run(app_context_t *app) {
                         first_decode_attempted = false;
                         frame_count = 0;
 
-                        // Update timing
+                        // Reset timing
                         clock_gettime(CLOCK_MONOTONIC, &current_time);
-                        startup_time = (double)current_time.tv_sec + current_time.tv_nsec / 1e9;
-                        last_frame_present_time = current_total_time;  // Reset timing for loop
+                        current_total_time = (double)current_time.tv_sec + current_time.tv_nsec / 1e9;
+                        startup_time = current_total_time;
+                        last_frame_present_time = current_total_time;
                     } else {
                         LOG_INFO("APP", "Playback finished");
                         app->running = false;
@@ -1359,11 +1377,8 @@ void app_run(app_context_t *app) {
         // Decode second video if available
         // ASYNC OPTIMIZATION: Use async decoder to overlap decode with rendering
         if (app->video2) {
-            // Video 2: Should we consume the next frame? (independent timing from V1)
-            // Dual-HW mode: Use 1.0 threshold (zero-copy, no GL overhead)
-            // Software mode: Use 0.90 threshold to compensate for 12ms GL upload overhead
-            double timing_threshold = app->video2->use_hardware_decode ? 1.0 : 0.90;
-            bool should_consume_v2 = (current_total_time - last_frame_present_time2 >= target_frame_time2 * timing_threshold);
+            // Video 2: Check if enough time passed for this video's FPS (independent from V1)
+            bool should_consume_v2 = (current_total_time - last_frame_present_time2 >= target_frame_time2);
 
             if (app->async_decoder_secondary) {
                 // AGGRESSIVE PRE-DECODE: Always keep decode thread busy by requesting next frame
@@ -1381,7 +1396,7 @@ void app_run(app_context_t *app) {
 
                 // Check if frame is available (non-blocking after first frame)
                 if (async_decode_wait_frame(app->async_decoder_secondary, wait_timeout_ms)) {
-                    // Frame is ready - decide whether to consume based on timing
+                    // Frame is ready - only consume if this video's frame time has elapsed
                     bool frame_available2 = false;
 
                     if (app->video2->skip_sw_transfer && video_has_dma_buffer(app->video2)) {
@@ -1396,29 +1411,28 @@ void app_run(app_context_t *app) {
                         }
                     }
 
-                    if (frame_available2) {
-                        // Frame is available - only consume if timing allows
-                        if (should_consume_v2) {
-                            frame_count2++;
+                    // Frame is available - but only CONSUME if timing allows
+                    if (frame_available2 && should_consume_v2) {
+                        frame_count2++;
 
-                            // Update last_frame_present_time2 when we consume a frame
-                            // This ensures correct timing at any display refresh rate
-                            last_frame_present_time2 = current_total_time;
+                        // Update timing for this video
+                        last_frame_present_time2 = current_total_time;
 
-                            // Mark frame ready for render
-                            new_secondary_frame_ready = true;
+                        // Mark frame ready for render
+                        new_secondary_frame_ready = true;
 
-                            if (!first_frame_decoded2) {
-                                LOG_INFO("DECODE", "First frame of video 2 decoded successfully (async)");
-                                first_frame_decoded2 = true;
-                            }
-
-                            // Request next frame immediately to keep decoder ahead
-                            secondary_async_requested = false;
+                        if (!first_frame_decoded2) {
+                            LOG_INFO("DECODE", "First frame of video 2 decoded successfully (async)");
+                            first_frame_decoded2 = true;
                         }
-                        // else: Frame is ready but timing says don't consume yet - hold it for next loop
+
+                        // Request next frame immediately after consuming
+                        secondary_async_requested = false;
+                    } else if (frame_available2 && !should_consume_v2) {
+                        // Frame ready but timing says don't consume yet - hold it
+                        // Don't request next frame, decoder can rest
                     } else {
-                        // No frame available, request one
+                        // No frame available yet - request one
                         secondary_async_requested = false;
                     }
                 }
@@ -1441,48 +1455,44 @@ void app_run(app_context_t *app) {
                         // Reset frame state
                         first_frame_decoded2 = false;
                         frame_count2 = 0;
-
-                        // Reset timing for loop
                         last_frame_present_time2 = current_total_time;
                     }
                 }
             } else {
                 // SYNC FALLBACK: If async decoder creation failed, use synchronous decode
-                // Only consume frames according to timing to prevent slow-motion playback
-                if (should_consume_v2) {
-                    if (next_frame_ready2 && first_frame_decoded2) {
+                // Only consume when this video's frame time has elapsed
+                if (should_consume_v2 && next_frame_ready2 && first_frame_decoded2) {
+                    video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,
+                                       &y_stride2, &u_stride2, &v_stride2);
+                    if (y_data2 != NULL) {
+                        frame_count2++;
+                        last_frame_present_time2 = current_total_time;
+                        new_secondary_frame_ready = true;
+                    }
+                    next_frame_ready2 = false;
+                } else if (should_consume_v2) {
+                    int decode_result = video_decode_frame(app->video2);
+                    if (decode_result == 0) {
                         video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,
                                            &y_stride2, &u_stride2, &v_stride2);
                         if (y_data2 != NULL) {
                             frame_count2++;
                             last_frame_present_time2 = current_total_time;
+                            if (!first_frame_decoded2) {
+                                LOG_INFO("DECODE", "First frame of video 2 decoded successfully (sync fallback)");
+                                first_frame_decoded2 = true;
+                            }
                             new_secondary_frame_ready = true;
+                            next_frame_ready2 = true;
                         }
-                        next_frame_ready2 = false;
-                    } else {
-                        int decode_result = video_decode_frame(app->video2);
-                        if (decode_result == 0) {
-                            video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,
-                                               &y_stride2, &u_stride2, &v_stride2);
-                            if (y_data2 != NULL) {
-                                frame_count2++;
-                                last_frame_present_time2 = current_total_time;
-                                if (!first_frame_decoded2) {
-                                    LOG_INFO("DECODE", "First frame of video 2 decoded successfully (sync fallback)");
-                                    first_frame_decoded2 = true;
-                                }
-                                new_secondary_frame_ready = true;
-                                next_frame_ready2 = true;
-                            }
-                        } else if (video_is_eof(app->video2)) {
-                            if (app->loop_playback) {
-                                LOG_INFO("APP", "End of video 2 reached - restarting playback (loop mode, sync)");
-                                video_seek(app->video2, 0);
-                                first_frame_decoded2 = false;
-                                next_frame_ready2 = false;
-                                frame_count2 = 0;
-                                last_frame_present_time2 = current_total_time;  // Reset timing for loop
-                            }
+                    } else if (video_is_eof(app->video2)) {
+                        if (app->loop_playback) {
+                            LOG_INFO("APP", "End of video 2 reached - restarting playback (loop mode, sync)");
+                            video_seek(app->video2, 0);
+                            first_frame_decoded2 = false;
+                            next_frame_ready2 = false;
+                            frame_count2 = 0;
+                            last_frame_present_time2 = current_total_time;
                         }
                     }
                 }
@@ -2149,63 +2159,21 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
             }
         }
 
-        // OPTIMIZED: Absolute timing with clock_nanosleep to eliminate cumulative drift
-        // Wake up 1.5ms early to allow vsync in eglSwapBuffers to handle final sync
-        // This prevents nanosleep overshoot from causing frame drops
-        static struct timespec next_frame_time = {0, 0};
-        static bool timing_initialized = false;
-
-        if (!timing_initialized) {
-            clock_gettime(CLOCK_MONOTONIC, &next_frame_time);
-            timing_initialized = true;
+        // FIXED: Smart pacing prevents busy-waiting and frame skips
+        // When NO frames consumed: sleep to prevent CPU spinning and frame skip issues
+        // When frames consumed: VSync from swap_buffers provides natural pacing
+        if (!new_primary_frame_ready && !new_secondary_frame_ready) {
+            // No frames were consumed this iteration - sleep briefly to:
+            // 1. Prevent busy-waiting (CPU waste)
+            // 2. Give VSync time to complete (prevents frame skips)
+            // 3. Allow decoder threads to finish
+            struct timespec short_sleep = {0, 1000000};  // 1ms
+            nanosleep(&short_sleep, NULL);
         }
 
-        // Calculate when next frame should be displayed (absolute time)
-        double target_seconds = target_frame_time;
-        long target_nsec = (long)(target_seconds * 1000000000);
-        next_frame_time.tv_nsec += target_nsec;
-        // Handle nanosecond overflow
-        if (next_frame_time.tv_nsec >= 1000000000) {
-            next_frame_time.tv_sec += next_frame_time.tv_nsec / 1000000000;
-            next_frame_time.tv_nsec %= 1000000000;
-        }
-
-        // Get current time
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-
-        // Calculate time until next frame
-        double time_until_next = (next_frame_time.tv_sec - now.tv_sec) +
-                                 (next_frame_time.tv_nsec - now.tv_nsec) / 1e9;
-
-        // Sleep until 1.5ms before target, let vsync handle the rest
-        // This reduces nanosleep jitter impact
-        const double early_wakeup_margin = 0.0015;  // 1.5ms early wakeup
-
-        if (time_until_next > early_wakeup_margin) {
-            struct timespec wakeup_time = next_frame_time;
-            long wakeup_ns_early = (long)(early_wakeup_margin * 1000000000);
-            wakeup_time.tv_nsec -= wakeup_ns_early;
-            if (wakeup_time.tv_nsec < 0) {
-                wakeup_time.tv_sec -= 1;
-                wakeup_time.tv_nsec += 1000000000;
-            }
-
-            // Use TIMER_ABSTIME for absolute timing (no cumulative drift)
-            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wakeup_time, NULL);
-        }
-
-        // If we're way behind (> 2 frames), reset timing to prevent infinite catchup
-        if (time_until_next < -target_frame_time * 2.0) {
-            clock_gettime(CLOCK_MONOTONIC, &next_frame_time);
-            if (app->show_timing) {
-                LOG_WARN("TIMING", "Timing reset - fell behind by %.1fms", -time_until_next * 1000);
-            }
-        }
-
-        if (app->show_timing && total_frame_time > target_frame_time * 1.5) {
+        if (app->show_timing && total_frame_time > loop_frame_time * 1.5) {
             LOG_WARN("TIMING", "Frame processing slow: %.1fms (target: %.1fms)",
-                   total_frame_time * 1000, target_frame_time * 1000);
+                   total_frame_time * 1000, loop_frame_time * 1000);
         }
     }  // End while (app->running)
     
