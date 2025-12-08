@@ -1994,6 +1994,77 @@ void video_seek(video_context_t *video, int64_t timestamp) {
     
     LOG_DEBUG("SEEK", "Seeking to timestamp %ld...", timestamp);
     
+    // CRITICAL FIX: V4L2 M2M hardware decoders have a state machine bug after EOF
+    // avcodec_flush_buffers() doesn't fully reset the kernel driver state
+    // The only reliable fix is to close and reopen the codec for each loop
+    bool is_v4l2m2m = false;
+    if (video->use_hardware_decode && video->codec_ctx && video->codec_ctx->codec) {
+        const char *codec_name = video->codec_ctx->codec->name;
+        is_v4l2m2m = (codec_name && strstr(codec_name, "v4l2m2m") != NULL);
+    }
+    
+    if (is_v4l2m2m && timestamp == 0) {
+        LOG_DEBUG("SEEK", "V4L2 M2M loop: closing and reopening codec for clean state");
+        
+        // Save what we need to reopen
+        const AVCodec *saved_codec = video->codec;
+        AVCodecParameters *codecpar = video->format_ctx->streams[video->video_stream_index]->codecpar;
+        
+        // Close old codec context completely
+        avcodec_free_context(&video->codec_ctx);
+        
+        // Allocate fresh codec context
+        video->codec_ctx = avcodec_alloc_context3(saved_codec);
+        if (!video->codec_ctx) {
+            LOG_ERROR("SEEK", "Failed to allocate new codec context for loop");
+            video->initialized = false;
+            return;
+        }
+        
+        // Copy parameters from stream
+        if (avcodec_parameters_to_context(video->codec_ctx, codecpar) < 0) {
+            LOG_ERROR("SEEK", "Failed to copy codec parameters for loop");
+            avcodec_free_context(&video->codec_ctx);
+            video->initialized = false;
+            return;
+        }
+        
+        // CRITICAL: Copy Annex-B extradata from BSF to new codec context
+        // The BSF filter has already converted the extradata, we need to reuse it
+        if (video->bsf_annexb_ctx && 
+            video->bsf_annexb_ctx->par_out->extradata && 
+            video->bsf_annexb_ctx->par_out->extradata_size > 0) {
+            
+            // Free any existing extradata
+            if (video->codec_ctx->extradata) {
+                av_freep(&video->codec_ctx->extradata);
+            }
+            
+            video->codec_ctx->extradata_size = video->bsf_annexb_ctx->par_out->extradata_size;
+            video->codec_ctx->extradata = av_mallocz(video->codec_ctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+            if (video->codec_ctx->extradata) {
+                memcpy(video->codec_ctx->extradata, 
+                       video->bsf_annexb_ctx->par_out->extradata, 
+                       video->codec_ctx->extradata_size);
+                LOG_DEBUG("SEEK", "Copied Annex-B extradata (%d bytes) to new codec context",
+                          video->codec_ctx->extradata_size);
+            }
+            
+            // Set codec_tag to 0 for Annex-B format
+            video->codec_ctx->codec_tag = 0;
+        }
+        
+        // Reopen codec
+        if (avcodec_open2(video->codec_ctx, saved_codec, NULL) < 0) {
+            LOG_ERROR("SEEK", "Failed to reopen V4L2 M2M codec for loop");
+            avcodec_free_context(&video->codec_ctx);
+            video->initialized = false;
+            return;
+        }
+        
+        LOG_DEBUG("SEEK", "V4L2 M2M codec reopened successfully");
+    }
+    
     // Reset EOF flag and frame count BEFORE seeking
     // frame_count reset ensures MAX_PACKETS_INITIAL is used for re-priming
     video->eof_reached = false;
@@ -2015,8 +2086,10 @@ void video_seek(video_context_t *video, int64_t timestamp) {
         return;
     }
     
-    // Flush decoder buffers
-    avcodec_flush_buffers(video->codec_ctx);
+    // Flush decoder buffers (skip if we just reopened codec - it's already clean)
+    if (!is_v4l2m2m && video->codec_ctx) {
+        avcodec_flush_buffers(video->codec_ctx);
+    }
     
     // Flush BSF buffers if present
     if (video->bsf_annexb_ctx) {
