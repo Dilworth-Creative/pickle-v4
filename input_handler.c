@@ -563,6 +563,17 @@ void input_update(input_context_t *input) {
                     bool was_pressed = input->gamepad_buttons[js.number];
                     input->gamepad_buttons[js.number] = (js.value != 0);
                     
+                    // Detect button release (falling edge) for L1/R1
+                    if (was_pressed && !input->gamepad_buttons[js.number]) {
+                        if (js.number == JS_BUTTON_L1) {
+                            input->l1_held = false;
+                            if (input->debug_gamepad) printf("[GAMEPAD] L1 released\n");
+                        } else if (js.number == JS_BUTTON_R1) {
+                            input->r1_held = false;
+                            if (input->debug_gamepad) printf("[GAMEPAD] R1 released\n");
+                        }
+                    }
+                    
                     // Detect button press (rising edge)
                     if (!was_pressed && input->gamepad_buttons[js.number]) {
                         input->gamepad_buttons_just_pressed[js.number] = true;
@@ -596,11 +607,15 @@ void input_update(input_context_t *input) {
                         } else if (js.number == JS_BUTTON_Y) {  // Button 4 = LEFT button (Y)
                             input->toggle_help = true;
                         } else if (js.number == JS_BUTTON_L1) {
-                            input->gamepad_increase_step = true;
-                            if (input->debug_gamepad) printf("[GAMEPAD] L1 pressed - increase step\n");
-                        } else if (js.number == JS_BUTTON_R1) {
                             input->gamepad_decrease_step = true;
-                            if (input->debug_gamepad) printf("[GAMEPAD] R1 pressed - decrease step\n");
+                            input->l1_held = true;  // Track held state
+                            input->l1_last_repeat_time = 0;  // Reset repeat timer
+                            if (input->debug_gamepad) printf("[GAMEPAD] L1 pressed - decrease step\n");
+                        } else if (js.number == JS_BUTTON_R1) {
+                            input->gamepad_increase_step = true;
+                            input->r1_held = true;  // Track held state
+                            input->r1_last_repeat_time = 0;  // Reset repeat timer
+                            if (input->debug_gamepad) printf("[GAMEPAD] R1 pressed - increase step\n");
                         } else if (js.number == JS_BUTTON_SELECT) {
                             input->gamepad_reset_keystone = true;
                         } else if (js.number == JS_BUTTON_START) {

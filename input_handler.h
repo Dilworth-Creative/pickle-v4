@@ -42,6 +42,12 @@ typedef struct {
     bool gamepad_toggle_corner_border;  // B button: toggle both borders and corners
     uint64_t gamepad_start_select_time; // For START+SELECT hold detection
     bool debug_gamepad;                 // Debug flag for logging button presses
+    
+    // L1/R1 held button tracking for continuous step adjustment
+    bool l1_held;                       // L1 button is currently held
+    bool r1_held;                       // R1 button is currently held
+    uint64_t l1_last_repeat_time;       // Time of last L1 repeat action (ms)
+    uint64_t r1_last_repeat_time;       // Time of last R1 repeat action (ms)
 } input_context_t;
 
 // Input handling functions

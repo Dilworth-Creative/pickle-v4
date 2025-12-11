@@ -31,6 +31,12 @@ typedef struct {
     double fps;
     int64_t duration;
     
+    // Frame reference ring buffer (prevents V4L2 buffer recycling during GPU render)
+    // We keep references to the last N frames to ensure the DMA buffers stay valid
+    #define FRAME_RING_SIZE 4
+    AVFrame *frame_ring[FRAME_RING_SIZE];
+    int frame_ring_index;
+    
     bool initialized;
     bool use_hardware_decode;
     hw_decode_type_t hw_decode_type;

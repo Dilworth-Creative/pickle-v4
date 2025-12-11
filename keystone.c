@@ -84,11 +84,23 @@ static int solve_linear_system(float A[8][9]) {
 }
 
 // Calculate perspective transformation matrix using a more stable algorithm
-static void calculate_perspective_matrix(float *matrix, const point_t corners[4]) {
+// If video dimensions are provided, the video fills the keystone area exactly
+// (may stretch if aspect ratios don't match - keystone corners define video edges)
+static void calculate_perspective_matrix_ex(float *matrix, const point_t corners[4],
+                                            int video_width, int video_height,
+                                            int display_width, int display_height) {
+    (void)video_width;   // Unused - video always fills keystone
+    (void)video_height;
+    (void)display_width;
+    (void)display_height;
+    
     // CORRECTED: For rendering, we need to transform FROM standard quad TO keystone trapezoid
-    // Source points: standard video quad (-1 to 1)
+    // Source points: standard video quad (-1 to 1) - video texture fills this completely
     float src_x[4] = {-1.0f, 1.0f, 1.0f, -1.0f};
     float src_y[4] = {1.0f, 1.0f, -1.0f, -1.0f};
+    
+    // No aspect ratio adjustment - video fills keystone area exactly
+    // The keystone corners define where the video edges appear on screen
     
     // Destination points: keystone corners (where the video should appear)
     // Corner order: top-left, top-right, bottom-right, bottom-left
@@ -274,7 +286,10 @@ void keystone_calculate_matrix(keystone_context_t *keystone) {
         return;
     }
     
-    calculate_perspective_matrix(keystone->matrix, keystone->corners);
+    // Use aspect-corrected perspective matrix if video dimensions are set
+    calculate_perspective_matrix_ex(keystone->matrix, keystone->corners,
+                                    keystone->video_width, keystone->video_height,
+                                    keystone->display_width, keystone->display_height);
     keystone->matrix_dirty = false;
 }
 
@@ -332,21 +347,55 @@ bool keystone_help_visible(keystone_context_t *keystone) {
 }
 
 void keystone_increase_step_size(keystone_context_t *keystone) {
-    // PRODUCTION: Ultra-fine increments for pixel-perfect control
-    keystone->move_step += 0.0001f;  // 0.01% increment
-    if (keystone->move_step > 0.01f) {
-        keystone->move_step = 0.01f; // Max step size
+    // IMPROVED: Exponential scaling for faster transitions between fine and coarse control
+    // Predefined step sizes for intuitive control:
+    // 0.0001 (ultra-fine) -> 0.0005 -> 0.001 -> 0.002 -> 0.005 -> 0.01 (coarse)
+    static const float step_levels[] = {0.0001f, 0.0002f, 0.0005f, 0.001f, 0.002f, 0.005f, 0.01f};
+    static const int num_levels = sizeof(step_levels) / sizeof(step_levels[0]);
+    
+    // Find current level and go to next
+    int current_level = 0;
+    for (int i = 0; i < num_levels; i++) {
+        if (keystone->move_step <= step_levels[i] * 1.01f) {  // Small tolerance
+            current_level = i;
+            break;
+        }
+        current_level = i;
     }
-    LOG_DEBUG("KEYSTONE", "Step size: %.4f", keystone->move_step);
+    
+    // Move to next higher level
+    if (current_level < num_levels - 1) {
+        keystone->move_step = step_levels[current_level + 1];
+    } else {
+        keystone->move_step = step_levels[num_levels - 1];  // Already at max
+    }
+    
+    LOG_DEBUG("KEYSTONE", "Step size increased to: %.4f", keystone->move_step);
 }
 
 void keystone_decrease_step_size(keystone_context_t *keystone) {
-    // PRODUCTION: Ultra-fine decrements for pixel-perfect control
-    keystone->move_step -= 0.0001f;  // 0.01% decrement
-    if (keystone->move_step < 0.0001f) {
-        keystone->move_step = 0.0001f; // Min step size
+    // IMPROVED: Exponential scaling for faster transitions between fine and coarse control
+    static const float step_levels[] = {0.0001f, 0.0002f, 0.0005f, 0.001f, 0.002f, 0.005f, 0.01f};
+    static const int num_levels = sizeof(step_levels) / sizeof(step_levels[0]);
+    
+    // Find current level and go to previous
+    int current_level = num_levels - 1;
+    for (int i = num_levels - 1; i >= 0; i--) {
+        if (keystone->move_step >= step_levels[i] * 0.99f) {  // Small tolerance
+            current_level = i;
+            break;
+        }
+        current_level = i;
     }
-    LOG_DEBUG("KEYSTONE", "Step size: %.4f", keystone->move_step);
+    
+    // Move to next lower level
+    if (current_level > 0) {
+        keystone->move_step = step_levels[current_level - 1];
+    } else {
+        keystone->move_step = step_levels[0];  // Already at min
+    }
+    
+    LOG_DEBUG("KEYSTONE", "Step size decreased to: %.4f", keystone->move_step);
 }
 
 float keystone_get_step_size(keystone_context_t *keystone) {
@@ -454,4 +503,43 @@ int keystone_load_settings(keystone_context_t *keystone) {
         }
     }
     return 0;
+}
+
+// Set video dimensions for aspect-corrected keystone mapping
+// This recalculates the perspective matrix so the video fills the keystone area
+// without letterboxing/pillarboxing - the keystone transformation includes
+// the aspect ratio correction.
+void keystone_set_video_dimensions(keystone_context_t *keystone,
+                                   int video_width, int video_height,
+                                   int display_width, int display_height) {
+    if (keystone->video_width != video_width ||
+        keystone->video_height != video_height ||
+        keystone->display_width != display_width ||
+        keystone->display_height != display_height) {
+        
+        keystone->video_width = video_width;
+        keystone->video_height = video_height;
+        keystone->display_width = display_width;
+        keystone->display_height = display_height;
+        keystone->matrix_dirty = true;  // Force matrix recalculation
+        
+        LOG_INFO("KEYSTONE", "Video dimensions set: %dx%d on %dx%d display",
+                 video_width, video_height, display_width, display_height);
+    }
+}
+
+void keystone_clear_video_dimensions(keystone_context_t *keystone) {
+    if (keystone->video_width != 0 || keystone->video_height != 0) {
+        keystone->video_width = 0;
+        keystone->video_height = 0;
+        keystone->display_width = 0;
+        keystone->display_height = 0;
+        keystone->matrix_dirty = true;  // Force matrix recalculation
+        
+        LOG_INFO("KEYSTONE", "Video dimensions cleared");
+    }
+}
+
+bool keystone_has_video_dimensions(keystone_context_t *keystone) {
+    return keystone->video_width > 0 && keystone->video_height > 0;
 }

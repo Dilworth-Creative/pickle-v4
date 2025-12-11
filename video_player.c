@@ -621,6 +621,12 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
         LOG_INFO("KEYSTONE", "Keystone 1 reset to correct defaults");
     }
     
+    // Set video dimensions for aspect-corrected keystone mapping
+    // This ensures the video fills the keystone area without letterboxing/pillarboxing
+    keystone_set_video_dimensions(app->keystone, 
+                                  app->video->width, app->video->height,
+                                  app->drm->width, app->drm->height);
+    
     // Initialize second keystone if second video provided
     if (video_file2) {
         if (keystone_init(app->keystone2) != 0) {
@@ -668,6 +674,11 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
                 LOG_INFO("APP", "Created pickle_keystone2.conf with default inset position");
             }
         }
+        
+        // Set video2 dimensions for aspect-corrected keystone2 mapping
+        keystone_set_video_dimensions(app->keystone2,
+                                      app->video2->width, app->video2->height,
+                                      app->drm->width, app->drm->height);
     }
 
     // Initialize input handler
@@ -1055,16 +1066,49 @@ void app_run(app_context_t *app) {
                 app->input->gamepad_cycle_corner = false;
             }
             
-            // L1/R1: Decrease/increase step size
+            // L1/R1: Decrease/increase step size (with held-button repeat)
+            // Initial press triggers immediate action
             if (app->input->gamepad_decrease_step) {
                 keystone_decrease_step_size(active_ks);
-                LOG_INFO("GAMEPAD", "R1 - Step size decreased to %.6f (keystone %d)", active_ks->move_step, app->active_keystone + 1);
+                LOG_INFO("GAMEPAD", "L1 - Step size decreased to %.4f (keystone %d)", active_ks->move_step, app->active_keystone + 1);
                 app->input->gamepad_decrease_step = false;
             }
             if (app->input->gamepad_increase_step) {
                 keystone_increase_step_size(active_ks);
-                LOG_INFO("GAMEPAD", "L1 - Step size increased to %.6f (keystone %d)", active_ks->move_step, app->active_keystone + 1);
+                LOG_INFO("GAMEPAD", "R1 - Step size increased to %.4f (keystone %d)", active_ks->move_step, app->active_keystone + 1);
                 app->input->gamepad_increase_step = false;
+            }
+            
+            // Held-button repeat for continuous step adjustment
+            // After initial 400ms delay, repeat every 200ms
+            {
+                uint64_t current_time_ms = (uint64_t)(current_total_time * 1000);
+                const uint64_t repeat_delay_ms = 400;   // Initial delay before repeat starts
+                const uint64_t repeat_rate_ms = 200;    // Time between repeats
+                
+                if (app->input->r1_held) {
+                    if (app->input->r1_last_repeat_time == 0) {
+                        // First time held - set initial delay
+                        app->input->r1_last_repeat_time = current_time_ms + repeat_delay_ms;
+                    } else if (current_time_ms >= app->input->r1_last_repeat_time) {
+                        // Repeat timer expired - trigger action
+                        keystone_increase_step_size(active_ks);
+                        LOG_DEBUG("GAMEPAD", "R1 held - Step size: %.4f", active_ks->move_step);
+                        app->input->r1_last_repeat_time = current_time_ms + repeat_rate_ms;
+                    }
+                }
+                
+                if (app->input->l1_held) {
+                    if (app->input->l1_last_repeat_time == 0) {
+                        // First time held - set initial delay
+                        app->input->l1_last_repeat_time = current_time_ms + repeat_delay_ms;
+                    } else if (current_time_ms >= app->input->l1_last_repeat_time) {
+                        // Repeat timer expired - trigger action
+                        keystone_decrease_step_size(active_ks);
+                        LOG_DEBUG("GAMEPAD", "L1 held - Step size: %.4f", active_ks->move_step);
+                        app->input->l1_last_repeat_time = current_time_ms + repeat_rate_ms;
+                    }
+                }
             }
             
             // SELECT: Reset keystone
@@ -1544,7 +1588,7 @@ void app_run(app_context_t *app) {
         if (help_visible) {
             // Just render black screen when help is up
             glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             // Skip video rendering entirely - will render help overlay below
             goto skip_video_render;
         }
@@ -1633,8 +1677,13 @@ void app_run(app_context_t *app) {
             }
         }
 
-        // When no new frame is ready, skip rendering - keep previous frame on screen
-        // Don't render black (causes flashing). Previous frame stays in GPU texture.
+        // When no new frame is ready, redraw the last uploaded frame to keep overlays stable
+        // This avoids swapping an unrendered buffer, which caused corner flicker in CPU path
+        if (!rendered && y_data && u_data && v_data && first_frame_decoded) {
+            gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height,
+                          y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
+            rendered = true;
+        }
         
         // Issue deferred async decode request once we finish uploading the frame
         if (using_async_primary && primary_async_request_pending && !primary_async_requested) {

@@ -170,6 +170,23 @@ static eglDestroyImageKHR_func eglDestroyImageKHR = NULL;
 #define EGL_YUV_NARROW_RANGE_EXT 0x3283
 #endif
 
+// EGLImage cache for zero-copy video rendering
+// V4L2 M2M decoder reuses DMA buffers, so we cache EGLImages by DMA FD
+// This prevents creating/destroying EGLImages every frame (expensive!)
+// Only create new EGLImage when DMA FD changes
+#define EGLIMAGE_CACHE_SIZE 16  // Enough for typical V4L2 buffer pool
+
+typedef struct {
+    int dma_fd;
+    EGLImage image;
+    int last_used_frame;  // For LRU eviction
+} eglimage_cache_entry_t;
+
+static eglimage_cache_entry_t g_image_cache[2][EGLIMAGE_CACHE_SIZE];  // Per-video caches
+static int g_frame_counter[2] = {0, 0};
+static bool g_cache_initialized = false;
+static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 typedef struct {
     uint8_t *y_temp_buffer;
     uint8_t *u_temp_buffer;
@@ -895,7 +912,7 @@ void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height,
     }
 
     if (clear_screen) {
-        glClear(GL_COLOR_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     }
 
     if (!gl_state_set) {
@@ -924,7 +941,16 @@ void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height,
     }
 
     float mvp_matrix[16];
-    calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->width, drm->height);
+    // When keystone has video dimensions, aspect correction is baked into the
+    // keystone matrix, so use identity MVP. Otherwise, apply standard aspect ratio.
+    if (keystone_has_video_dimensions(keystone)) {
+        // Identity matrix - keystone handles aspect correction
+        for (int i = 0; i < 16; i++) {
+            mvp_matrix[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+        }
+    } else {
+        calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->width, drm->height);
+    }
     glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
 
     const float *keystone_matrix = keystone_get_matrix(keystone);
@@ -1016,7 +1042,7 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
     
     // Only clear screen if requested (first video clears, second doesn't)
     if (clear_screen) {
-        glClear(GL_COLOR_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     }
     
     // Set up OpenGL state only once or when needed
@@ -1055,7 +1081,16 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
     // Set MVP matrix with aspect ratio preservation (recalculate for each video!)
     // This is OUTSIDE the video_index==0 block so each video gets its own aspect ratio
     float mvp_matrix[16];
-    calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->width, drm->height);
+    // When keystone has video dimensions, aspect correction is baked into the
+    // keystone matrix, so use identity MVP. Otherwise, apply standard aspect ratio.
+    if (keystone_has_video_dimensions(keystone)) {
+        // Identity matrix - keystone handles aspect correction
+        for (int i = 0; i < 16; i++) {
+            mvp_matrix[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+        }
+    } else {
+        calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->width, drm->height);
+    }
     glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
 
     // Set keystone matrix (may change dynamically)
@@ -1326,7 +1361,8 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     // Check if update needed for THIS specific keystone
     bool visibility_changed = (last_show_corners[keystone_idx] != keystone->show_corners);
     bool selection_changed = (cached_selected_corners[keystone_idx] != keystone->selected_corner);
-    bool needs_update = keystone->corners_dirty || visibility_changed || selection_changed;
+    // ALWAYS update to fix flickering - caching logic was causing issues
+    bool needs_update = true; // keystone->corners_dirty || visibility_changed || selection_changed;
 
     // Update cached state for THIS keystone
     last_show_corners[keystone_idx] = keystone->show_corners;
@@ -1415,12 +1451,22 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     // Always bind and render (even if not updated)
     glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
     
+    // CRITICAL: Unbind EBO left over from video rendering - prevents index buffer interference
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    
+    // CRITICAL: Disable vertex attribs from video shader before setting corner attribs
+    // This prevents attribute state leakage that causes flickering
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
+    
     // Enable blending for transparent overlays
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     
-    // Disable depth testing to ensure overlays are always visible
+    // Force overlays to ignore depth completely to avoid z-fighting/flicker
     glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
     
     // Use corner shader program
     glUseProgram(gl->corner_program);
@@ -1451,9 +1497,9 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     glDisableVertexAttribArray(gl->corner_a_position);
     glDisableVertexAttribArray(1); // Disable color attribute
     
-    // Disable blending and restore depth testing
+    // Disable blending and restore depth writes for subsequent draws
     glDisable(GL_BLEND);
-    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
     
     // CRITICAL: Restore GL state - unbind VBO to prevent interference
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -1464,97 +1510,138 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
         return; // Don't render border if not visible
     }
     
+    // PRODUCTION FIX: Separate VBOs for each keystone to prevent cross-contamination
+    // Using shared VBO caused flickering when both keystones render borders
+    static float cached_border_vertices[2][48]; // 2 keystones, 8 vertices * 6 floats
+    static bool vertices_cached[2] = {false, false};
+    static point_t cached_corners[2][4];
+    static GLuint border_vbo[2] = {0, 0};
+    static bool vbo_initialized = false;
+    
+    // Initialize separate VBOs for each keystone on first call
+    if (!vbo_initialized) {
+        glGenBuffers(2, border_vbo);
+        for (int i = 0; i < 2; i++) {
+            glBindBuffer(GL_ARRAY_BUFFER, border_vbo[i]);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(cached_border_vertices[0]), NULL, GL_DYNAMIC_DRAW);
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        vbo_initialized = true;
+    }
+    
+    // Determine which keystone this is (0 or 1) based on pointer comparison
+    // This is a simple heuristic - works for dual keystone setup
+    int ks_index = 0;  // Default to first keystone
+    static keystone_context_t *first_keystone = NULL;
+    if (!first_keystone) {
+        first_keystone = keystone;
+    } else if (keystone != first_keystone) {
+        ks_index = 1;
+    }
+    
+    // Check if corners changed
+    bool corners_changed = !vertices_cached[ks_index];
+    if (vertices_cached[ks_index]) {
+        for (int i = 0; i < 4; i++) {
+            if (cached_corners[ks_index][i].x != keystone->corners[i].x ||
+                cached_corners[ks_index][i].y != keystone->corners[i].y) {
+                corners_changed = true;
+                break;
+            }
+        }
+    }
+    
+    float *border_vertices = cached_border_vertices[ks_index];
+    
+    if (corners_changed) {
+        // Yellow color for all border vertices
+        float r = 1.0f, g = 1.0f, b = 0.0f, a = 1.0f;
+        
+        point_t *corners = keystone->corners;
+        
+        // Line 1: Top-left to top-right
+        border_vertices[0] = corners[CORNER_TOP_LEFT].x;
+        border_vertices[1] = corners[CORNER_TOP_LEFT].y;
+        border_vertices[2] = r; border_vertices[3] = g; border_vertices[4] = b; border_vertices[5] = a;
+        border_vertices[6] = corners[CORNER_TOP_RIGHT].x;
+        border_vertices[7] = corners[CORNER_TOP_RIGHT].y;
+        border_vertices[8] = r; border_vertices[9] = g; border_vertices[10] = b; border_vertices[11] = a;
+        
+        // Line 2: Top-right to bottom-right
+        border_vertices[12] = corners[CORNER_TOP_RIGHT].x;
+        border_vertices[13] = corners[CORNER_TOP_RIGHT].y;
+        border_vertices[14] = r; border_vertices[15] = g; border_vertices[16] = b; border_vertices[17] = a;
+        border_vertices[18] = corners[CORNER_BOTTOM_RIGHT].x;
+        border_vertices[19] = corners[CORNER_BOTTOM_RIGHT].y;
+        border_vertices[20] = r; border_vertices[21] = g; border_vertices[22] = b; border_vertices[23] = a;
+        
+        // Line 3: Bottom-right to bottom-left
+        border_vertices[24] = corners[CORNER_BOTTOM_RIGHT].x;
+        border_vertices[25] = corners[CORNER_BOTTOM_RIGHT].y;
+        border_vertices[26] = r; border_vertices[27] = g; border_vertices[28] = b; border_vertices[29] = a;
+        border_vertices[30] = corners[CORNER_BOTTOM_LEFT].x;
+        border_vertices[31] = corners[CORNER_BOTTOM_LEFT].y;
+        border_vertices[32] = r; border_vertices[33] = g; border_vertices[34] = b; border_vertices[35] = a;
+        
+        // Line 4: Bottom-left to top-left
+        border_vertices[36] = corners[CORNER_BOTTOM_LEFT].x;
+        border_vertices[37] = corners[CORNER_BOTTOM_LEFT].y;
+        border_vertices[38] = r; border_vertices[39] = g; border_vertices[40] = b; border_vertices[41] = a;
+        border_vertices[42] = corners[CORNER_TOP_LEFT].x;
+        border_vertices[43] = corners[CORNER_TOP_LEFT].y;
+        border_vertices[44] = r; border_vertices[45] = g; border_vertices[46] = b; border_vertices[47] = a;
+        
+        // Cache the corners
+        for (int i = 0; i < 4; i++) {
+            cached_corners[ks_index][i] = corners[i];
+        }
+        vertices_cached[ks_index] = true;
+        
+        // Update VBO only when vertices changed - use per-keystone VBO
+        glBindBuffer(GL_ARRAY_BUFFER, border_vbo[ks_index]);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(cached_border_vertices[0]), border_vertices);
+    } else {
+        // Just bind the existing VBO for this keystone
+        glBindBuffer(GL_ARRAY_BUFFER, border_vbo[ks_index]);
+    }
+    
+    // CRITICAL: Unbind EBO and reset attrib state from video rendering
+    // This prevents state leakage that causes flickering
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
+    
     // Enable blending for transparent overlays
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    
-    // Disable depth testing to ensure overlays are always visible
+    // Ignore depth for overlays to prevent flicker
     glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
     
-    // Create border line vertices with color (4 lines connecting the corners)
-    // Each vertex: x, y, r, g, b, a (6 floats per vertex)
-    float border_vertices[48]; // 8 vertices * 6 floats = 48 floats
-    
-    // Yellow color for all border vertices
-    float r = 1.0f, g = 1.0f, b = 0.0f, a = 1.0f;
-    
-    // Show the control point positions (where user has positioned corners)
-    point_t *corners = keystone->corners;
-    
-    // Line 1: Top-left to top-right (use direct Y coordinates)
-    border_vertices[0] = corners[CORNER_TOP_LEFT].x;
-    border_vertices[1] = corners[CORNER_TOP_LEFT].y;
-    border_vertices[2] = r; border_vertices[3] = g; border_vertices[4] = b; border_vertices[5] = a;
-    border_vertices[6] = corners[CORNER_TOP_RIGHT].x;
-    border_vertices[7] = corners[CORNER_TOP_RIGHT].y;
-    border_vertices[8] = r; border_vertices[9] = g; border_vertices[10] = b; border_vertices[11] = a;
-    
-    // Line 2: Top-right to bottom-right
-    border_vertices[12] = corners[CORNER_TOP_RIGHT].x;
-    border_vertices[13] = corners[CORNER_TOP_RIGHT].y;
-    border_vertices[14] = r; border_vertices[15] = g; border_vertices[16] = b; border_vertices[17] = a;
-    border_vertices[18] = corners[CORNER_BOTTOM_RIGHT].x;
-    border_vertices[19] = corners[CORNER_BOTTOM_RIGHT].y;
-    border_vertices[20] = r; border_vertices[21] = g; border_vertices[22] = b; border_vertices[23] = a;
-    
-    // Line 3: Bottom-right to bottom-left
-    border_vertices[24] = corners[CORNER_BOTTOM_RIGHT].x;
-    border_vertices[25] = corners[CORNER_BOTTOM_RIGHT].y;
-    border_vertices[26] = r; border_vertices[27] = g; border_vertices[28] = b; border_vertices[29] = a;
-    border_vertices[30] = corners[CORNER_BOTTOM_LEFT].x;
-    border_vertices[31] = corners[CORNER_BOTTOM_LEFT].y;
-    border_vertices[32] = r; border_vertices[33] = g; border_vertices[34] = b; border_vertices[35] = a;
-    
-    // Line 4: Bottom-left to top-left
-    border_vertices[36] = corners[CORNER_BOTTOM_LEFT].x;
-    border_vertices[37] = corners[CORNER_BOTTOM_LEFT].y;
-    border_vertices[38] = r; border_vertices[39] = g; border_vertices[40] = b; border_vertices[41] = a;
-    border_vertices[42] = corners[CORNER_TOP_LEFT].x;
-    border_vertices[43] = corners[CORNER_TOP_LEFT].y;
-    border_vertices[44] = r; border_vertices[45] = g; border_vertices[46] = b; border_vertices[47] = a;
-    
-    // Update border VBO with new positions - OPTIMIZED: use glBufferSubData
-    glBindBuffer(GL_ARRAY_BUFFER, gl->border_vbo);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(border_vertices), border_vertices);
-    
-    // Use corner shader program (same as corners, just different geometry)
+    // Use corner shader program
     glUseProgram(gl->corner_program);
     
-    // Set up vertex attributes (interleaved position + color)
-    int stride = 6 * sizeof(float); // x, y, r, g, b, a
+    // Set up vertex attributes
+    int stride = 6 * sizeof(float);
     glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
     glEnableVertexAttribArray(gl->corner_a_position);
-    
-    // Color attribute at location 1
     glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
     glEnableVertexAttribArray(1);
     
-    // Set identity matrix for MVP (border in normalized coordinates)
-    float identity[16] = {
-        1, 0, 0, 0,
-        0, 1, 0, 0,
-        0, 0, 1, 0,
-        0, 0, 0, 1
-    };
+    // Set identity matrix for MVP
+    float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
     
-    // Set line width for refined appearance
     glLineWidth(2.0f);
-    
-    // Draw border as 4 separate lines (8 vertices with colors from vertex data)
-    glDrawArrays(GL_LINES, 0, 8); // 8 vertices (4 lines * 2 vertices each)
-    
-    // Reset line width
+    glDrawArrays(GL_LINES, 0, 8);
     glLineWidth(1.0f);
     
     glDisableVertexAttribArray(gl->corner_a_position);
     glDisableVertexAttribArray(1);
-    
-    // Disable blending and restore depth testing
     glDisable(GL_BLEND);
-    glEnable(GL_DEPTH_TEST);
-    
-    // NOTE: Don't unbind buffers here - video_player.c handles complete state restoration
+    glDepthMask(GL_TRUE);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
 // Render display boundary (red rectangle showing max projector/display area)
@@ -1614,15 +1701,19 @@ void gl_render_display_boundary(gl_context_t *gl, keystone_context_t *keystone) 
     boundary_vertices[43] = 1.0f;   // top-left y
     boundary_vertices[44] = r; boundary_vertices[45] = g; boundary_vertices[46] = b; boundary_vertices[47] = a;
     
-    // Create temporary VBO for boundary if needed
+    // Create VBO for boundary once
     static GLuint boundary_vbo = 0;
-    if (boundary_vbo == 0) {
+    static bool vbo_initialized = false;
+    if (!vbo_initialized) {
         glGenBuffers(1, &boundary_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, boundary_vbo);
+        // Allocate buffer once with GL_STATIC_DRAW (boundary never changes)
+        glBufferData(GL_ARRAY_BUFFER, sizeof(boundary_vertices), boundary_vertices, GL_STATIC_DRAW);
+        vbo_initialized = true;
+    } else {
+        // Just bind the existing VBO - no need to update (boundary is always the same)
+        glBindBuffer(GL_ARRAY_BUFFER, boundary_vbo);
     }
-    
-    // Update boundary VBO
-    glBindBuffer(GL_ARRAY_BUFFER, boundary_vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(boundary_vertices), boundary_vertices, GL_DYNAMIC_DRAW);
     
     // Use corner shader program
     glUseProgram(gl->corner_program);
@@ -2505,7 +2596,16 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
 
     // Set MVP matrix with aspect ratio preservation (recalculate for each video!)
     float mvp_matrix[16];
-    calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->mode.hdisplay, drm->mode.vdisplay);
+    // When keystone has video dimensions, aspect correction is baked into the
+    // keystone matrix, so use identity MVP. Otherwise, apply standard aspect ratio.
+    if (keystone_has_video_dimensions(keystone)) {
+        // Identity matrix - keystone handles aspect correction
+        for (int i = 0; i < 16; i++) {
+            mvp_matrix[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+        }
+    } else {
+        calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->mode.hdisplay, drm->mode.vdisplay);
+    }
     glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
 
     if (gl->u_use_nv12 >= 0) {
@@ -2727,6 +2827,18 @@ bool gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int heigh
     GLenum texture_unit = (video_index == 0) ? GL_TEXTURE0 : GL_TEXTURE1;
     GLint sampler_unit = (video_index == 0) ? 0 : 1;
 
+    // CRITICAL: Reset GL state before video render to prevent interference from overlay rendering
+    // This fixes escalating render times when overlays are visible
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glUseProgram(0);
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+
     // Set up rendering state
     glViewport(0, 0, drm->mode.hdisplay, drm->mode.vdisplay);
     if (clear_screen && video_index == 0) {
@@ -2750,7 +2862,16 @@ bool gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int heigh
 
     // Set MVP matrix with aspect ratio preservation
     float mvp_matrix[16];
-    calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->mode.hdisplay, drm->mode.vdisplay);
+    // When keystone has video dimensions, aspect correction is baked into the
+    // keystone matrix, so use identity MVP. Otherwise, apply standard aspect ratio.
+    if (keystone_has_video_dimensions(keystone)) {
+        // Identity matrix - keystone handles aspect correction
+        for (int i = 0; i < 16; i++) {
+            mvp_matrix[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+        }
+    } else {
+        calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->mode.hdisplay, drm->mode.vdisplay);
+    }
     glUniformMatrix4fv(gl->ext_u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
 
     // Set keystone matrix
@@ -2760,82 +2881,107 @@ bool gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int heigh
     // Flip Y coordinate for video
     glUniform1f(gl->ext_u_flip_y, 1.0f);
 
-    // Create multi-plane YUV EGLImage using DRM_FORMAT_YUV420
-    // All three planes share the same DMA FD with different offsets
-    // Colorspace hints ensure correct BT.709 TV-range conversion (matching SW path)
-    EGLint attribs[] = {
-        EGL_WIDTH, width,
-        EGL_HEIGHT, height,
-        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_YUV420,
-        // Colorspace hints for accurate YUV→RGB conversion (BT.709 TV-range to match SW path)
-        EGL_YUV_COLOR_SPACE_HINT_EXT, EGL_ITU_REC709_EXT,        // Use BT.709 color matrix
-        EGL_SAMPLE_RANGE_HINT_EXT, EGL_YUV_NARROW_RANGE_EXT,     // Use TV range (16-235 luma, 16-240 chroma)
-        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[0],
-        EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[0],
-        EGL_DMA_BUF_PLANE1_FD_EXT, dma_fd,
-        EGL_DMA_BUF_PLANE1_OFFSET_EXT, plane_offsets[1],
-        EGL_DMA_BUF_PLANE1_PITCH_EXT, plane_pitches[1],
-        EGL_DMA_BUF_PLANE2_FD_EXT, dma_fd,
-        EGL_DMA_BUF_PLANE2_OFFSET_EXT, plane_offsets[2],
-        EGL_DMA_BUF_PLANE2_PITCH_EXT, plane_pitches[2],
-        EGL_NONE
-    };
-
-    // DEEP BUFFER EGLImages: Keep 12 frames in flight to avoid DMA buffer contention
-    // In dual-hw mode, both V4L2 decoders share the same hardware, causing contention
-    // when GPU tries to access a buffer that V4L2 hasn't fully released yet.
-    // 12 frames = 200ms at 60fps - by then the GPU is definitely done with the buffer.
-    // NO FENCE SYNC - just rely on deep buffering to avoid races.
-    #define EGLIMAGE_BUFFER_DEPTH 12
-    static EGLImage image_ring[2][EGLIMAGE_BUFFER_DEPTH] = {
-        {EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE, 
-         EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE,
-         EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE},
-        {EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE,
-         EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE,
-         EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE}
-    };
-    static int ring_index[2] = {0, 0};  // Next slot to write to
-    static pthread_mutex_t ring_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-    EGLImage yuv_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
-                                           EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, attribs);
-    EGLint egl_err = eglGetError();
-
-    // DUAL-HW FIX: If EGLImage creation fails, reuse the most recent valid image
-    // This prevents flickering when DMA buffer is temporarily unavailable
-    bool using_fallback = false;
-    if (yuv_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
-        pthread_mutex_lock(&ring_mutex);
-        // Find the most recent valid image (search backwards from current position)
-        for (int i = EGLIMAGE_BUFFER_DEPTH - 1; i >= 0; i--) {
-            int check_idx = (ring_index[video_index] - 1 - i + EGLIMAGE_BUFFER_DEPTH) % EGLIMAGE_BUFFER_DEPTH;
-            if (image_ring[video_index][check_idx] != EGL_NO_IMAGE) {
-                yuv_image = image_ring[video_index][check_idx];
-                using_fallback = true;
-                static int fallback_count[2] = {0, 0};
-                if (fallback_count[video_index] < 5) {
-                    LOG_DEBUG("EXT", "V%d EGLImage import failed (0x%x), reusing previous frame",
-                             video_index + 1, egl_err);
-                    fallback_count[video_index]++;
-                }
+    // Initialize EGLImage cache if needed
+    if (!g_cache_initialized) {
+        pthread_mutex_lock(&g_cache_mutex);
+        for (int v = 0; v < 2; v++) {
+            for (int i = 0; i < EGLIMAGE_CACHE_SIZE; i++) {
+                g_image_cache[v][i].dma_fd = -1;
+                g_image_cache[v][i].image = EGL_NO_IMAGE;
+                g_image_cache[v][i].last_used_frame = 0;
+            }
+        }
+        g_cache_initialized = true;
+        pthread_mutex_unlock(&g_cache_mutex);
+    }
+    
+    // Increment frame counter for LRU tracking
+    g_frame_counter[video_index]++;
+    
+    // Look up EGLImage in cache by DMA FD
+    pthread_mutex_lock(&g_cache_mutex);
+    EGLImage yuv_image = EGL_NO_IMAGE;
+    
+    for (int i = 0; i < EGLIMAGE_CACHE_SIZE; i++) {
+        if (g_image_cache[video_index][i].dma_fd == dma_fd) {
+            // Cache hit! Reuse existing EGLImage
+            yuv_image = g_image_cache[video_index][i].image;
+            g_image_cache[video_index][i].last_used_frame = g_frame_counter[video_index];
+            break;
+        }
+    }
+    
+    // Cache miss - need to create new EGLImage
+    if (yuv_image == EGL_NO_IMAGE) {
+        EGLint attribs[] = {
+            EGL_WIDTH, width,
+            EGL_HEIGHT, height,
+            EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_YUV420,
+            EGL_YUV_COLOR_SPACE_HINT_EXT, EGL_ITU_REC709_EXT,
+            EGL_SAMPLE_RANGE_HINT_EXT, EGL_YUV_NARROW_RANGE_EXT,
+            EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[0],
+            EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[0],
+            EGL_DMA_BUF_PLANE1_FD_EXT, dma_fd,
+            EGL_DMA_BUF_PLANE1_OFFSET_EXT, plane_offsets[1],
+            EGL_DMA_BUF_PLANE1_PITCH_EXT, plane_pitches[1],
+            EGL_DMA_BUF_PLANE2_FD_EXT, dma_fd,
+            EGL_DMA_BUF_PLANE2_OFFSET_EXT, plane_offsets[2],
+            EGL_DMA_BUF_PLANE2_PITCH_EXT, plane_pitches[2],
+            EGL_NONE
+        };
+        
+        yuv_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
+                                      EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, attribs);
+        
+        if (yuv_image == EGL_NO_IMAGE) {
+            pthread_mutex_unlock(&g_cache_mutex);
+            static int fail_count = 0;
+            if (fail_count++ < 5) {
+                EGLint err = eglGetError();
+                LOG_WARN("EXT", "V%d EGLImage creation failed: 0x%x", video_index + 1, err);
+            }
+            return false;
+        }
+        
+        // Find empty slot or evict LRU entry
+        int slot = -1;
+        for (int i = 0; i < EGLIMAGE_CACHE_SIZE; i++) {
+            if (g_image_cache[video_index][i].dma_fd == -1) {
+                slot = i;
                 break;
             }
         }
-        pthread_mutex_unlock(&ring_mutex);
         
-        if (!using_fallback) {
-            // No previous image to fall back to - this is first frame failure
-            static int err_count[2] = {0, 0};
-            if (err_count[video_index] < 5) {
-                LOG_WARN("EXT", "V%d EGLImage import failed (0x%x), no fallback available",
-                         video_index + 1, egl_err);
-                err_count[video_index]++;
+        if (slot == -1) {
+            // No empty slots - evict LRU
+            int oldest_frame = g_frame_counter[video_index];
+            for (int i = 0; i < EGLIMAGE_CACHE_SIZE; i++) {
+                if (g_image_cache[video_index][i].last_used_frame < oldest_frame) {
+                    oldest_frame = g_image_cache[video_index][i].last_used_frame;
+                    slot = i;
+                }
             }
-            return false;  // Signal caller to use CPU fallback (if available)
+            
+            // Destroy old EGLImage
+            if (g_image_cache[video_index][slot].image != EGL_NO_IMAGE && eglDestroyImageKHR) {
+                (*eglDestroyImageKHR)(gl->egl_display, g_image_cache[video_index][slot].image);
+            }
+        }
+        
+        // Store new EGLImage in cache
+        g_image_cache[video_index][slot].dma_fd = dma_fd;
+        g_image_cache[video_index][slot].image = yuv_image;
+        g_image_cache[video_index][slot].last_used_frame = g_frame_counter[video_index];
+        
+        static int cache_misses = 0;
+        if (cache_misses++ < 20) {
+            LOG_DEBUG("EXT", "V%d EGLImage cache miss (fd=%d), created new (total misses: %d)", 
+                     video_index + 1, dma_fd, cache_misses);
         }
     }
+    
+    pthread_mutex_unlock(&g_cache_mutex);
 
     // Bind to GL_TEXTURE_EXTERNAL_OES using video-specific texture unit
     glActiveTexture(texture_unit);
@@ -2846,11 +2992,15 @@ bool gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int heigh
         glGetError();
     }
 
-    // Set texture parameters
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    // Set texture parameters only once per texture (tracked by static flags)
+    static bool tex_params_set[2] = {false, false};
+    if (!tex_params_set[video_index]) {
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        tex_params_set[video_index] = true;
+    }
 
     // Set sampler uniform to the video-specific texture unit
     glUniform1i(gl->ext_u_texture_external, sampler_unit);
@@ -2858,30 +3008,18 @@ bool gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int heigh
     // Draw
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
 
-    // Deep-buffer EGLImage management - simple ring buffer, no fence sync
-    // Only update ring if we created a NEW image (not reusing fallback)
-    if (!using_fallback) {
-        pthread_mutex_lock(&ring_mutex);
-        
-        int oldest_idx = ring_index[video_index];
-        
-        // Destroy the oldest EGLImage (it's been 12 frames, GPU is done)
-        if (image_ring[video_index][oldest_idx] != EGL_NO_IMAGE && eglDestroyImageKHR) {
-            (*eglDestroyImageKHR)(gl->egl_display, image_ring[video_index][oldest_idx]);
-        }
-        
-        // Store new image in the ring and advance index
-        image_ring[video_index][oldest_idx] = yuv_image;
-        ring_index[video_index] = (oldest_idx + 1) % EGLIMAGE_BUFFER_DEPTH;
-        
-        pthread_mutex_unlock(&ring_mutex);
-    }
-    // else: Reusing previous image due to EGLImage creation failure - don't modify ring
+    // Clean up GL state to prevent interference with overlay rendering
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 
+    // EGLImage is now cached and reused - no per-frame management needed
     // Log first successful render
     static bool logged = false;
     if (!logged) {
-        LOG_INFO("GL", "Zero-copy YUV420 render via external texture");
+        LOG_INFO("GL", "Zero-copy YUV420 render via external texture (cached EGLImages)");
         logged = true;
     }
 
@@ -2918,6 +3056,20 @@ void gl_cleanup(gl_context_t *gl) {
 
     // Clean up pre-allocated YUV buffers
     free_yuv_buffers();
+    
+    // Clean up EGLImage cache
+    pthread_mutex_lock(&g_cache_mutex);
+    for (int v = 0; v < 2; v++) {
+        for (int i = 0; i < EGLIMAGE_CACHE_SIZE; i++) {
+            if (g_image_cache[v][i].image != EGL_NO_IMAGE && eglDestroyImageKHR) {
+                (*eglDestroyImageKHR)(gl->egl_display, g_image_cache[v][i].image);
+                g_image_cache[v][i].image = EGL_NO_IMAGE;
+                g_image_cache[v][i].dma_fd = -1;
+            }
+        }
+    }
+    g_cache_initialized = false;
+    pthread_mutex_unlock(&g_cache_mutex);
     
     if (gl->egl_surface != EGL_NO_SURFACE) {
         eglDestroySurface(gl->egl_display, gl->egl_surface);

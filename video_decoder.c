@@ -1037,6 +1037,12 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         video_cleanup(video);
         return -1;
     }
+    
+    // Initialize frame ring buffer (prevents V4L2 buffer recycling during GPU render)
+    for (int i = 0; i < FRAME_RING_SIZE; i++) {
+        video->frame_ring[i] = NULL;
+    }
+    video->frame_ring_index = 0;
 
     // Allocate software frame used when decoding to hardware formats (e.g. DRM_PRIME).
     // We will transfer hardware frames into this CPU-accessible YUV420P frame
@@ -1157,6 +1163,25 @@ int video_decode_frame(video_context_t *video) {
             pthread_mutex_lock(&video->lock);
             video->frame_count++;
             int frame_count = video->frame_count;
+            
+            // CRITICAL: Keep frame references in ring buffer to prevent V4L2 buffer recycling
+            // V4L2 M2M reuses buffers, so if we don't hold a reference, the buffer
+            // may be overwritten while the GPU is still reading from it via EGLImage
+            if (video->use_hardware_decode && video->frame->format == AV_PIX_FMT_DRM_PRIME) {
+                int slot = video->frame_ring_index;
+                
+                // Free old frame reference at this slot
+                if (video->frame_ring[slot] != NULL) {
+                    av_frame_free(&video->frame_ring[slot]);
+                }
+                
+                // Clone current frame to hold reference (keeps V4L2 buffer alive)
+                video->frame_ring[slot] = av_frame_clone(video->frame);
+                
+                // Advance ring index
+                video->frame_ring_index = (slot + 1) % FRAME_RING_SIZE;
+            }
+            
             pthread_mutex_unlock(&video->lock);
             
             if (frame_count == 1) {
@@ -2006,6 +2031,19 @@ void video_seek(video_context_t *video, int64_t timestamp) {
     if (is_v4l2m2m && timestamp == 0) {
         LOG_DEBUG("SEEK", "V4L2 M2M loop: closing and reopening codec for clean state");
         
+        // CRITICAL: Clear frame ring buffer BEFORE closing codec
+        // These frames hold references to V4L2 buffers from the current codec
+        // If we don't clear them, we leak buffer references
+        pthread_mutex_lock(&video->lock);
+        for (int i = 0; i < FRAME_RING_SIZE; i++) {
+            if (video->frame_ring[i] != NULL) {
+                av_frame_free(&video->frame_ring[i]);
+                video->frame_ring[i] = NULL;
+            }
+        }
+        video->frame_ring_index = 0;
+        pthread_mutex_unlock(&video->lock);
+        
         // Save what we need to reopen
         const AVCodec *saved_codec = video->codec;
         AVCodecParameters *codecpar = video->format_ctx->streams[video->video_stream_index]->codecpar;
@@ -2142,6 +2180,15 @@ void video_cleanup(video_context_t *video) {
         av_frame_free(&video->frame);
         video->frame = NULL;
     }
+    
+    // Clean up frame ring buffer (holds V4L2 buffer references)
+    for (int i = 0; i < FRAME_RING_SIZE; i++) {
+        if (video->frame_ring[i] != NULL) {
+            av_frame_free(&video->frame_ring[i]);
+            video->frame_ring[i] = NULL;
+        }
+    }
+    
     if (video->sw_frame) {
         av_frame_free(&video->sw_frame);
         video->sw_frame = NULL;

@@ -127,6 +127,31 @@ With performance governor enabled:
 
 
 
+#### logging fix
+
+
+[Service]
+# ...existing config...
+
+# Keep TTY for DRM/KMS display
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVTDisallocate=yes
+StandardInput=tty
+
+# BUT redirect stderr to journal for logging
+StandardOutput=tty
+StandardError=journal
+
+# Add identifier for easy filtering
+SyslogIdentifier=pickle
+
+sudo systemctl daemon-reload
+sudo systemctl restart pickle.service
+
+# Now logs will appear in journal
+journalctl -t pickle -f
+
 
 
 

@@ -26,6 +26,12 @@ typedef struct {
     
     // Movement sensitivity
     float move_step;
+    
+    // Video aspect ratio for perspective-corrected mapping
+    int video_width;     // Current video width (0 = not set)
+    int video_height;    // Current video height (0 = not set)
+    int display_width;   // Display width for aspect calculation
+    int display_height;  // Display height for aspect calculation
 } keystone_context_t;
 
 // Keystone correction functions
@@ -50,6 +56,15 @@ int keystone_save_to_file(keystone_context_t *keystone, const char *filename);
 int keystone_load_from_file(keystone_context_t *keystone, const char *filename);
 int keystone_save_settings(keystone_context_t *keystone);
 int keystone_load_settings(keystone_context_t *keystone);
+
+// Video aspect ratio support - call when video dimensions change
+// This recalculates the perspective matrix to map the aspect-corrected video
+// directly to the keystone corners (instead of letterboxing/pillarboxing inside)
+void keystone_set_video_dimensions(keystone_context_t *keystone, 
+                                   int video_width, int video_height,
+                                   int display_width, int display_height);
+void keystone_clear_video_dimensions(keystone_context_t *keystone);
+bool keystone_has_video_dimensions(keystone_context_t *keystone);
 
 // Corner indices
 #define CORNER_TOP_LEFT     0
