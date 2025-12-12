@@ -103,6 +103,21 @@ static eglCreateImageKHR_func eglCreateImageKHR = NULL;
 static glEGLImageTargetTexture2DOES_func glEGLImageTargetTexture2DOES = NULL;
 static eglDestroyImageKHR_func eglDestroyImageKHR = NULL;
 
+// EXT_disjoint_timer_query function pointers
+typedef void (GL_APIENTRYP PFNGLGENQUERIESEXTPROC)(GLsizei n, GLuint *ids);
+typedef void (GL_APIENTRYP PFNGLDELETEQUERIESEXTPROC)(GLsizei n, const GLuint *ids);
+typedef void (GL_APIENTRYP PFNGLBEGINQUERYEXTPROC)(GLenum target, GLuint id);
+typedef void (GL_APIENTRYP PFNGLENDQUERYEXTPROC)(GLenum target);
+typedef void (GL_APIENTRYP PFNGLGETQUERYOBJECTUI64VEXTPROC)(GLuint id, GLenum pname, GLuint64 *params);
+typedef void (GL_APIENTRYP PFNGLGETQUERYOBJECTUIVEXTPROC)(GLuint id, GLenum pname, GLuint *params);
+
+static PFNGLGENQUERIESEXTPROC glGenQueriesEXT = NULL;
+static PFNGLDELETEQUERIESEXTPROC glDeleteQueriesEXT = NULL;
+static PFNGLBEGINQUERYEXTPROC glBeginQueryEXT = NULL;
+static PFNGLENDQUERYEXTPROC glEndQueryEXT = NULL;
+static PFNGLGETQUERYOBJECTUI64VEXTPROC glGetQueryObjectui64vEXT = NULL;
+static PFNGLGETQUERYOBJECTUIVEXTPROC glGetQueryObjectuivEXT = NULL;
+
 #ifndef EGL_LINUX_DMA_BUF_EXT
 #define EGL_LINUX_DMA_BUF_EXT 0x3270
 #endif
@@ -153,6 +168,17 @@ static eglDestroyImageKHR_func eglDestroyImageKHR = NULL;
 #endif
 #ifndef DRM_FORMAT_YUV420
 #define DRM_FORMAT_YUV420 0x32315559  // YU12
+#endif
+
+// Timer queries (EXT_disjoint_timer_query)
+#ifndef GL_TIME_ELAPSED_EXT
+#define GL_TIME_ELAPSED_EXT 0x88BF
+#endif
+#ifndef GL_QUERY_RESULT_EXT
+#define GL_QUERY_RESULT_EXT 0x8866
+#endif
+#ifndef GL_QUERY_RESULT_AVAILABLE_EXT
+#define GL_QUERY_RESULT_AVAILABLE_EXT 0x8867
 #endif
 
 // EGL colorspace hint extensions for accurate YUV→RGB conversion
@@ -370,6 +396,31 @@ const char *corner_fragment_shader_source =
     "    fragColor = v_color;\n"
     "}\n";
 
+// Instanced corner shader: instance supplies center+size+color, base quad is unit square
+const char *corner_inst_vertex_shader_source =
+    "#version 310 es\n"
+    "precision mediump float;\n"
+    "layout(location = 0) in vec2 a_unit_pos;\n"  // [-1,1] square
+    "uniform mat4 u_mvp_matrix;\n"
+    "uniform vec4 u_corner_data[4];\n"  // xyz: center.xy, size, w unused
+    "uniform vec4 u_corner_color[4];\n"
+    "out vec4 v_color;\n"
+    "void main() {\n"
+    "    int idx = gl_InstanceID;\n"
+    "    vec2 center = u_corner_data[idx].xy;\n"
+    "    float size = u_corner_data[idx].z;\n"
+    "    vec2 pos = center + a_unit_pos * size;\n"
+    "    gl_Position = u_mvp_matrix * vec4(pos, 0.0, 1.0);\n"
+    "    v_color = u_corner_color[idx];\n"
+    "}\n";
+
+const char *corner_inst_fragment_shader_source =
+    "#version 310 es\n"
+    "precision mediump float;\n"
+    "in vec4 v_color;\n"
+    "out vec4 fragColor;\n"
+    "void main() { fragColor = v_color; }\n";
+
 // External texture shader for zero-copy YUV EGLImage import
 // Uses GL_OES_EGL_image_external extension with samplerExternalOES
 // Note: ESSL 1.00 required for samplerExternalOES (not ESSL 3.x)
@@ -524,6 +575,91 @@ static int create_corner_program(gl_context_t *gl) {
     glDeleteShader(corner_fragment_shader);
 
     return 0;
+}
+
+static int create_corner_instanced_program(gl_context_t *gl) {
+    GLuint vs = compile_shader(GL_VERTEX_SHADER, corner_inst_vertex_shader_source);
+    if (!vs) return -1;
+    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, corner_inst_fragment_shader_source);
+    if (!fs) {
+        glDeleteShader(vs);
+        return -1;
+    }
+
+    gl->corner_inst_program = glCreateProgram();
+    glAttachShader(gl->corner_inst_program, vs);
+    glAttachShader(gl->corner_inst_program, fs);
+    glLinkProgram(gl->corner_inst_program);
+
+    GLint linked;
+    glGetProgramiv(gl->corner_inst_program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        GLint length;
+        glGetProgramiv(gl->corner_inst_program, GL_INFO_LOG_LENGTH, &length);
+        char *log = malloc(length);
+        if (log) {
+            glGetProgramInfoLog(gl->corner_inst_program, length, NULL, log);
+            LOG_ERROR("GL", "Corner instanced program link failed: %s", log);
+            free(log);
+        }
+        glDeleteProgram(gl->corner_inst_program);
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        gl->corner_inst_program = 0;
+        return -1;
+    }
+
+    gl->corner_inst_a_unit_pos = glGetAttribLocation(gl->corner_inst_program, "a_unit_pos");
+    gl->corner_inst_u_mvp_matrix = glGetUniformLocation(gl->corner_inst_program, "u_mvp_matrix");
+    gl->corner_inst_u_corner_data = glGetUniformLocation(gl->corner_inst_program, "u_corner_data");
+    gl->corner_inst_u_corner_color = glGetUniformLocation(gl->corner_inst_program, "u_corner_color");
+
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    return 0;
+}
+
+// Unified OSD state helpers
+static void osd_begin(gl_context_t *gl) {
+    (void)gl; // currently unused
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
+
+static void osd_end(gl_context_t *gl) {
+    (void)gl; // currently unused
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_DEPTH_TEST);
+}
+
+static void timer_begin(gl_context_t *gl, GLuint *queries, int *write_idx) {
+    if (!gl || !gl->supports_timer_query || !glBeginQueryEXT || !queries[*write_idx]) return;
+    glBeginQueryEXT(GL_TIME_ELAPSED_EXT, queries[*write_idx]);
+}
+
+// Returns elapsed ms for the previous query (ping-pong), or -1 if not ready
+static double timer_end_poll(gl_context_t *gl, GLuint *queries, int *write_idx) {
+    if (!gl || !gl->supports_timer_query || !glEndQueryEXT || !queries[*write_idx]) return -1.0;
+
+    glEndQueryEXT(GL_TIME_ELAPSED_EXT);
+
+    int read_idx = (*write_idx) ^ 1;
+    GLuint available = 0;
+    glGetQueryObjectuivEXT(queries[read_idx], GL_QUERY_RESULT_AVAILABLE_EXT, &available);
+
+    // Advance write index for next frame
+    *write_idx = read_idx;
+
+    if (!available) return -1.0;
+
+    GLuint64 ns = 0;
+    glGetQueryObjectui64vEXT(queries[read_idx], GL_QUERY_RESULT_EXT, &ns);
+    return (double)ns / 1000000.0; // ms
 }
 
 static int create_external_program(gl_context_t *gl) {
@@ -724,6 +860,31 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
     gl->egl_image_y2 = EGL_NO_IMAGE;
     gl->egl_image_uv2 = EGL_NO_IMAGE;
 
+    // Timer query support (EXT_disjoint_timer_query)
+    const char *extensions = (const char *)glGetString(GL_EXTENSIONS);
+    gl->supports_timer_query = false;
+    gl->osd_timer_write_idx = 0;
+    gl->corner_timer_write_idx = 0;
+    memset(gl->osd_timer_queries, 0, sizeof(gl->osd_timer_queries));
+    memset(gl->corner_timer_queries, 0, sizeof(gl->corner_timer_queries));
+    if (extensions && strstr(extensions, "GL_EXT_disjoint_timer_query")) {
+        glGenQueriesEXT = (PFNGLGENQUERIESEXTPROC)eglGetProcAddress("glGenQueriesEXT");
+        glDeleteQueriesEXT = (PFNGLDELETEQUERIESEXTPROC)eglGetProcAddress("glDeleteQueriesEXT");
+        glBeginQueryEXT = (PFNGLBEGINQUERYEXTPROC)eglGetProcAddress("glBeginQueryEXT");
+        glEndQueryEXT = (PFNGLENDQUERYEXTPROC)eglGetProcAddress("glEndQueryEXT");
+        glGetQueryObjectui64vEXT = (PFNGLGETQUERYOBJECTUI64VEXTPROC)eglGetProcAddress("glGetQueryObjectui64vEXT");
+        glGetQueryObjectuivEXT = (PFNGLGETQUERYOBJECTUIVEXTPROC)eglGetProcAddress("glGetQueryObjectuivEXT");
+        if (glGenQueriesEXT && glDeleteQueriesEXT && glBeginQueryEXT && glEndQueryEXT &&
+            glGetQueryObjectui64vEXT && glGetQueryObjectuivEXT) {
+            gl->supports_timer_query = true;
+            glGenQueriesEXT(2, gl->osd_timer_queries);
+            glGenQueriesEXT(2, gl->corner_timer_queries);
+            LOG_INFO("GL", "EXT_disjoint_timer_query enabled for OSD timing");
+        } else {
+            LOG_WARN("GL", "EXT_disjoint_timer_query present but function pointers missing; disabling timers");
+        }
+    }
+
     // Create shaders and program
     if (create_program(gl) != 0) {
         gl_cleanup(gl);
@@ -732,6 +893,12 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
 
     // Create corner rendering program
     if (create_corner_program(gl) != 0) {
+        gl_cleanup(gl);
+        return -1;
+    }
+
+    // Create instanced corner rendering program
+    if (create_corner_instanced_program(gl) != 0) {
         gl_cleanup(gl);
         return -1;
     }
@@ -875,6 +1042,18 @@ void gl_setup_buffers(gl_context_t *gl) {
     
     // Setup corner highlight VBO - will be updated with actual corner positions
     glGenBuffers(1, &gl->corner_vbo);
+
+    // Setup instanced corner unit quad VBO (four verts for line loop outline)
+    float corner_unit_quad[] = {
+        -0.5f, -0.5f,
+         0.5f, -0.5f,
+         0.5f,  0.5f,
+        -0.5f,  0.5f
+    };
+    glGenBuffers(1, &gl->corner_inst_unit_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, gl->corner_inst_unit_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(corner_unit_quad), corner_unit_quad, GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
     
     // Setup border VBO - OPTIMIZED: pre-allocate buffer for 8 vertices * 6 floats
     // This avoids glBufferData reallocation every frame when border is visible
@@ -1310,176 +1489,148 @@ int gl_create_shaders(gl_context_t *gl) {
     return create_program(gl);
 }
 
+static bool keystone_has_visible_overlays(keystone_context_t *keystone) {
+    if (!keystone) return false;
+    return keystone->show_corners || keystone->show_border || keystone->show_help;
+}
+
+static void render_keystone_osd(gl_context_t *gl,
+                                keystone_context_t *keystone,
+                                int keystone_index,
+                                int active_keystone,
+                                bool allow_drawables) {
+    if (!keystone) return;
+
+    int saved_selected = -1;
+    if (active_keystone >= 0 && active_keystone != keystone_index && keystone->selected_corner >= 0) {
+        saved_selected = keystone->selected_corner;
+        keystone->selected_corner = -1;
+    }
+
+    if (allow_drawables) {
+        if (keystone->show_corners) {
+            gl_render_corners(gl, keystone);
+        }
+        if (keystone->show_border) {
+            gl_render_border(gl, keystone);
+            gl_render_display_boundary(gl, keystone);
+        }
+    }
+
+    // Help overlay is allowed even when we skip other drawables
+    if (keystone->show_help) {
+        gl_render_help_overlay(gl, keystone);
+    }
+
+    if (saved_selected >= 0) {
+        keystone->selected_corner = saved_selected;
+    }
+}
+
+void gl_render_osd(gl_context_t *gl,
+                   keystone_context_t *keystone1,
+                   keystone_context_t *keystone2,
+                   int active_keystone,
+                   bool keystone2_ready,
+                   const char *notification_message) {
+    if (!gl) return;
+
+    bool ks1_visible = keystone_has_visible_overlays(keystone1);
+    bool ks2_visible = keystone_has_visible_overlays(keystone2);
+    bool has_notification = (notification_message && notification_message[0] != '\0');
+    if (!ks1_visible && !ks2_visible && !has_notification) {
+        return;
+    }
+
+    // CRITICAL: Finish pending video commands before switching to overlay shaders
+    // glFinish() ensures GPU completes external texture rendering before overlay pass
+    // This prevents pipeline stalls and flicker from external texture -> overlay transitions
+    glFinish();
+
+    double osd_ms = -1.0;
+    if (gl->supports_timer_query) {
+        timer_begin(gl, gl->osd_timer_queries, &gl->osd_timer_write_idx);
+    }
+
+    osd_begin(gl);
+
+    render_keystone_osd(gl, keystone1, 0, active_keystone, true);
+    render_keystone_osd(gl, keystone2, 1, active_keystone, keystone2_ready);
+
+    if (has_notification) {
+        gl_render_notification_overlay(gl, notification_message);
+    }
+
+    osd_end(gl);
+
+    if (gl->supports_timer_query) {
+        osd_ms = timer_end_poll(gl, gl->osd_timer_queries, &gl->osd_timer_write_idx);
+        static int osd_log_count = 0;
+        if (osd_ms >= 0.0 && osd_ms > 5.0 && osd_log_count < 5) {
+            LOG_WARN("GL", "OSD GPU time: %.2fms", osd_ms);
+            osd_log_count++;
+        }
+    }
+}
+
 void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
-    if (!keystone || !keystone->show_corners) {
-        return; // Don't render corners if not visible
+    if (!keystone || !keystone->show_corners || gl->corner_inst_program == 0 || gl->corner_inst_unit_vbo == 0) {
+        return;
     }
 
-    // PRODUCTION FIX: Separate VBOs and state tracking for each keystone
-    // This prevents flickering when rendering corners for dual keystones
-    static float corner_vertices1[10000];  // Keystone 1 vertex buffer
-    static float corner_vertices2[10000];  // Keystone 2 vertex buffer
-    static GLuint corner_vbo1 = 0;
-    static GLuint corner_vbo2 = 0;
-    static bool vbo_initialized = false;
-
-    // Per-keystone state tracking (indexed by keystone: 0 = first seen, 1 = second seen)
-    static keystone_context_t *keystone_ptrs[2] = {NULL, NULL};
-    static int cached_selected_corners[2] = {-2, -2};
-    static bool last_show_corners[2] = {false, false};
-
-    // Initialize VBOs once on first call
-    if (!vbo_initialized) {
-        glGenBuffers(1, &corner_vbo1);
-        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo1);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(corner_vertices1), NULL, GL_DYNAMIC_DRAW);
-
-        glGenBuffers(1, &corner_vbo2);
-        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo2);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(corner_vertices2), NULL, GL_DYNAMIC_DRAW);
-
-        vbo_initialized = true;
+    if (gl->corner_inst_a_unit_pos < 0 || gl->corner_inst_u_mvp_matrix < 0 ||
+        gl->corner_inst_u_corner_data < 0 || gl->corner_inst_u_corner_color < 0) {
+        static bool logged = false;
+        if (!logged) {
+            LOG_WARN("GL", "Instanced corner locations not available; skipping corner render");
+            logged = true;
+        }
+        return;
     }
 
-    // Determine which keystone index (0 or 1) based on pointer
-    int keystone_idx = -1;
-    if (keystone == keystone_ptrs[0] || keystone_ptrs[0] == NULL) {
-        keystone_idx = 0;
-        keystone_ptrs[0] = keystone;
-    } else if (keystone == keystone_ptrs[1] || keystone_ptrs[1] == NULL) {
-        keystone_idx = 1;
-        keystone_ptrs[1] = keystone;
-    } else {
-        // Fallback: use index 0 if pointer doesn't match either
-        keystone_idx = 0;
-    }
-
-    // Select the appropriate VBO and vertex buffer for this keystone
-    GLuint corner_vbo = (keystone_idx == 0) ? corner_vbo1 : corner_vbo2;
-    float *corner_vertices = (keystone_idx == 0) ? corner_vertices1 : corner_vertices2;
-
-    // Check if update needed for THIS specific keystone
-    bool visibility_changed = (last_show_corners[keystone_idx] != keystone->show_corners);
-    bool selection_changed = (cached_selected_corners[keystone_idx] != keystone->selected_corner);
-    // ALWAYS update to fix flickering - caching logic was causing issues
-    bool needs_update = true; // keystone->corners_dirty || visibility_changed || selection_changed;
-
-    // Update cached state for THIS keystone
-    last_show_corners[keystone_idx] = keystone->show_corners;
-    
-    // Always prepare corner colors (outside needs_update so available for rendering)
+    // Prepare per-corner data for uniforms
+    float corner_size = 0.006f; // smaller to reduce fragment area
+    float corner_data[4][4];
     float corner_colors[4][4];
+
+    // Snap to pixel grid when display size is known to reduce subpixel shimmer
+    float px_x = (keystone->display_width > 0) ? (2.0f / (float)keystone->display_width) : 0.0f;
+    float px_y = (keystone->display_height > 0) ? (2.0f / (float)keystone->display_height) : 0.0f;
+
     for (int i = 0; i < 4; i++) {
+        float cx = keystone->corners[i].x;
+        float cy = keystone->corners[i].y;
+        if (px_x > 0.0f && px_y > 0.0f) {
+            cx = roundf(cx / px_x) * px_x;
+            cy = roundf(cy / px_y) * px_y;
+        }
+
+        corner_data[i][0] = cx;
+        corner_data[i][1] = cy;
+        corner_data[i][2] = corner_size;
+        corner_data[i][3] = 0.0f; // unused
+
         if (keystone->selected_corner == i) {
-            // Bright green for selected - semi-transparent to show border
             corner_colors[i][0] = 0.0f;
             corner_colors[i][1] = 1.0f;
             corner_colors[i][2] = 0.0f;
-            corner_colors[i][3] = 0.5f;  // 50% opacity for selected
+            corner_colors[i][3] = 1.0f;  // opaque to avoid blend cost/flicker
         } else {
-            // White with transparency for unselected - allow border to show through
             corner_colors[i][0] = 1.0f;
             corner_colors[i][1] = 1.0f;
             corner_colors[i][2] = 1.0f;
-            corner_colors[i][3] = 0.3f;  // 30% opacity for unselected
+            corner_colors[i][3] = 1.0f;  // opaque to avoid blend cost/flicker
         }
     }
-    
-    if (needs_update) {
-        cached_selected_corners[keystone_idx] = keystone->selected_corner;
-        keystone->corners_dirty = false;  // Clear dirty flag
-        
-        // Create corner positions (small squares)
-        float corner_size = 0.008f; // 0.8% of screen size (refined and elegant)
-        
-        // Corner vertices with colors: [x, y, r, g, b, a] per vertex
-        int vertex_count = 0;
-        
-        // Render corner indicators at the keystone corner positions
-        for (int i = 0; i < 4; i++) {
-            // Get the keystone corner position
-            float tx = keystone->corners[i].x;
-            float ty = keystone->corners[i].y;
-            float *color = corner_colors[i];
-            
-            // Create a small square with per-vertex colors (6 floats per vertex: x, y, r, g, b, a)
-            if (vertex_count + 4 <= 1600) { // Leave room for text
-                // Bottom-left
-                corner_vertices[vertex_count*6 + 0] = tx - corner_size;
-                corner_vertices[vertex_count*6 + 1] = ty - corner_size;
-                corner_vertices[vertex_count*6 + 2] = color[0];
-                corner_vertices[vertex_count*6 + 3] = color[1];
-                corner_vertices[vertex_count*6 + 4] = color[2];
-                corner_vertices[vertex_count*6 + 5] = color[3];
-                vertex_count++;
-                
-                // Bottom-right
-                corner_vertices[vertex_count*6 + 0] = tx + corner_size;
-                corner_vertices[vertex_count*6 + 1] = ty - corner_size;
-                corner_vertices[vertex_count*6 + 2] = color[0];
-                corner_vertices[vertex_count*6 + 3] = color[1];
-                corner_vertices[vertex_count*6 + 4] = color[2];
-                corner_vertices[vertex_count*6 + 5] = color[3];
-                vertex_count++;
-                
-                // Top-right
-                corner_vertices[vertex_count*6 + 0] = tx + corner_size;
-                corner_vertices[vertex_count*6 + 1] = ty + corner_size;
-                corner_vertices[vertex_count*6 + 2] = color[0];
-                corner_vertices[vertex_count*6 + 3] = color[1];
-                corner_vertices[vertex_count*6 + 4] = color[2];
-                corner_vertices[vertex_count*6 + 5] = color[3];
-                vertex_count++;
-                
-                // Top-left
-                corner_vertices[vertex_count*6 + 0] = tx - corner_size;
-                corner_vertices[vertex_count*6 + 1] = ty + corner_size;
-                corner_vertices[vertex_count*6 + 2] = color[0];
-                corner_vertices[vertex_count*6 + 3] = color[1];
-                corner_vertices[vertex_count*6 + 4] = color[2];
-                corner_vertices[vertex_count*6 + 5] = color[3];
-                vertex_count++;
-            }
-        }
-        
-        // OPTIMIZED: Use glBufferSubData instead of glBufferData
-        // glBufferSubData only updates the data, much faster than reallocating
-        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, vertex_count * 6 * sizeof(float), corner_vertices);
-    }  // End needs_update block
-    
-    // Always bind and render (even if not updated)
-    glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
-    
-    // CRITICAL: Unbind EBO left over from video rendering - prevents index buffer interference
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    
+
+    keystone->corners_dirty = false;
+
     // CRITICAL: Disable vertex attribs from video shader before setting corner attribs
-    // This prevents attribute state leakage that causes flickering
     glDisableVertexAttribArray(0);
     glDisableVertexAttribArray(1);
-    
-    // Enable blending for transparent overlays
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    
-    // Force overlays to ignore depth completely to avoid z-fighting/flicker
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
-    glDisable(GL_CULL_FACE);
-    
-    // Use corner shader program
-    glUseProgram(gl->corner_program);
-    
-    // Set up vertex attributes - interleaved position (2) + color (4)
-    int stride = 6 * sizeof(float);
-    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
-    glEnableVertexAttribArray(gl->corner_a_position);
-    
-    // Enable color attribute (location 1)
-    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-    
+
+    glUseProgram(gl->corner_inst_program);
+
     // Set identity matrix for MVP (corners in normalized coordinates)
     float identity[16] = {
         1, 0, 0, 0,
@@ -1487,20 +1638,22 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
         0, 0, 1, 0,
         0, 0, 0, 1
     };
-    glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
-    
-    // Draw all corner squares - each corner is 4 vertices
-    for (int i = 0; i < 4; i++) {
-        glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
-    }
-    
-    glDisableVertexAttribArray(gl->corner_a_position);
-    glDisableVertexAttribArray(1); // Disable color attribute
-    
-    // Disable blending and restore depth writes for subsequent draws
+    glUniformMatrix4fv(gl->corner_inst_u_mvp_matrix, 1, GL_FALSE, identity);
+    glUniform4fv(gl->corner_inst_u_corner_data, 4, &corner_data[0][0]);
+    glUniform4fv(gl->corner_inst_u_corner_color, 4, &corner_colors[0][0]);
+
+    glBindBuffer(GL_ARRAY_BUFFER, gl->corner_inst_unit_vbo);
+    glVertexAttribPointer(gl->corner_inst_a_unit_pos, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(gl->corner_inst_a_unit_pos);
+
+    // Draw with blending disabled to remove alpha flicker and reduce cost
     glDisable(GL_BLEND);
-    glDepthMask(GL_TRUE);
-    
+    // Draw instanced corner outlines (4 verts per loop, 4 instances)
+    glDrawArraysInstanced(GL_LINE_LOOP, 0, 4, 4);
+    glEnable(GL_BLEND);
+
+    glDisableVertexAttribArray(gl->corner_inst_a_unit_pos);
+
     // CRITICAL: Restore GL state - unbind VBO to prevent interference
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
@@ -1611,14 +1764,6 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     glDisableVertexAttribArray(0);
     glDisableVertexAttribArray(1);
     
-    // Enable blending for transparent overlays
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    // Ignore depth for overlays to prevent flicker
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
-    glDisable(GL_CULL_FACE);
-    
     // Use corner shader program
     glUseProgram(gl->corner_program);
     
@@ -1633,14 +1778,15 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
     
+    // Borders are opaque; disable blending to avoid artifacts with external video path
+    glDisable(GL_BLEND);
     glLineWidth(2.0f);
     glDrawArrays(GL_LINES, 0, 8);
     glLineWidth(1.0f);
+    glEnable(GL_BLEND);
     
     glDisableVertexAttribArray(gl->corner_a_position);
     glDisableVertexAttribArray(1);
-    glDisable(GL_BLEND);
-    glDepthMask(GL_TRUE);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
@@ -1649,13 +1795,6 @@ void gl_render_display_boundary(gl_context_t *gl, keystone_context_t *keystone) 
     if (!keystone || !keystone->show_border) {
         return; // Don't render boundary if border not visible
     }
-    
-    // Enable blending for transparent overlay
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    
-    // Disable depth testing to ensure overlay is always visible
-    glDisable(GL_DEPTH_TEST);
     
     // Create boundary line vertices - rectangle covering full display
     // Normalized coordinates: (-1, -1) to (1, 1)
@@ -1747,10 +1886,6 @@ void gl_render_display_boundary(gl_context_t *gl, keystone_context_t *keystone) 
     
     glDisableVertexAttribArray(gl->corner_a_position);
     glDisableVertexAttribArray(1);
-    
-    // Disable blending and restore depth testing
-    glDisable(GL_BLEND);
-    glEnable(GL_DEPTH_TEST);
 }
 static const unsigned char font_5x7[128][7] = {
     [' '] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
@@ -1964,13 +2099,6 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
     };
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
 
-    // Enable blending for transparency
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-    // Disable depth testing to ensure overlays are always visible
-    glDisable(GL_DEPTH_TEST);
-
     // Draw help overlay background (semi-transparent black from vertex colors)
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4); // Background rectangle
 
@@ -2036,10 +2164,6 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
     int num_quads = text_vertex_count / 4;
     glDrawElements(GL_TRIANGLES, num_quads * 6, GL_UNSIGNED_INT, 0);
     
-    // Disable blending and restore depth testing
-    glDisable(GL_BLEND);
-    glEnable(GL_DEPTH_TEST);
-    
     glDisableVertexAttribArray(gl->corner_a_position);
     glDisableVertexAttribArray(1);
 
@@ -2094,11 +2218,6 @@ void gl_render_notification_overlay(gl_context_t *gl, const char *message) {
     };
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
 
-    // Enable blending for transparency
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glDisable(GL_DEPTH_TEST);
-
     // Draw notification background
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
@@ -2131,8 +2250,6 @@ void gl_render_notification_overlay(gl_context_t *gl, const char *message) {
     }
 
     // Restore GL state
-    glDisable(GL_BLEND);
-    glEnable(GL_DEPTH_TEST);
     glDisableVertexAttribArray(gl->corner_a_position);
     glDisableVertexAttribArray(1);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -3027,6 +3144,15 @@ bool gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int heigh
 }
 
 void gl_cleanup(gl_context_t *gl) {
+    if (gl->supports_timer_query && glDeleteQueriesEXT) {
+        if (gl->osd_timer_queries[0] || gl->osd_timer_queries[1]) {
+            glDeleteQueriesEXT(2, gl->osd_timer_queries);
+        }
+        if (gl->corner_timer_queries[0] || gl->corner_timer_queries[1]) {
+            glDeleteQueriesEXT(2, gl->corner_timer_queries);
+        }
+    }
+
     // Clean up YUV textures (video 1)
     if (gl->texture_y) glDeleteTextures(1, &gl->texture_y);
     if (gl->texture_u) glDeleteTextures(1, &gl->texture_u);
@@ -3042,10 +3168,14 @@ void gl_cleanup(gl_context_t *gl) {
     if (gl->vbo) glDeleteBuffers(1, &gl->vbo);
     if (gl->ebo) glDeleteBuffers(1, &gl->ebo);
     if (gl->corner_vbo) glDeleteBuffers(1, &gl->corner_vbo);
+    if (gl->corner_inst_unit_vbo) glDeleteBuffers(1, &gl->corner_inst_unit_vbo);
+    if (gl->corner_inst_unit_vbo) glDeleteBuffers(1, &gl->corner_inst_unit_vbo);
     if (gl->border_vbo) glDeleteBuffers(1, &gl->border_vbo);
     if (gl->help_vbo) glDeleteBuffers(1, &gl->help_vbo);
     if (gl->program) glDeleteProgram(gl->program);
     if (gl->corner_program) glDeleteProgram(gl->corner_program);
+    if (gl->corner_inst_program) glDeleteProgram(gl->corner_inst_program);
+    if (gl->corner_inst_program) glDeleteProgram(gl->corner_inst_program);
     if (gl->external_program) glDeleteProgram(gl->external_program);
     if (gl->vertex_shader) glDeleteShader(gl->vertex_shader);
     if (gl->fragment_shader) glDeleteShader(gl->fragment_shader);

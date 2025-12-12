@@ -1575,12 +1575,6 @@ void app_run(app_context_t *app) {
         // Time the main GL rendering
         clock_gettime(CLOCK_MONOTONIC, &gl_render_start);
 
-        // Initialize overlay visibility flags (needed for goto skip path)
-        bool any_overlay_visible = (app->keystone && (app->keystone->show_corners ||
-                                                     app->keystone->show_border));
-        bool any_overlay_visible2 = (app->keystone2 && (app->keystone2->show_corners ||
-                                                       app->keystone2->show_border));
-
         // OPTIMIZATION: Blank video when help overlay is displayed (cleaner, faster, no flicker)
         bool help_visible = (app->keystone && app->keystone->show_help) ||
                            (app->keystone2 && app->keystone2->show_help);
@@ -1756,6 +1750,15 @@ void app_run(app_context_t *app) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
                     upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
                 }
+
+                rendered2 = true;
+            }
+
+            // When no new frame is ready, redraw last uploaded frame for stability (CPU path)
+            if (!rendered2 && y_data2 && u_data2 && v_data2 && first_frame_decoded2) {
+                gl_render_frame(app->gl, NULL, NULL, NULL, video_width2, video_height2,
+                              y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
+                rendered2 = true;
             }
         }
         
@@ -1793,93 +1796,7 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
         // Time overlay rendering
         clock_gettime(CLOCK_MONOTONIC, &overlay_start);
         
-        // OPTIMIZED: Only render overlays when actually needed
-        // Render overlays for first keystone
-        // NOTE: Overlay visibility was already checked above to determine rendering path
-        if (any_overlay_visible) {
-            // No special GL setup needed - overlays render on top of video
-            // (we already switched to OpenGL path if overlays are visible)
-
-            // PRODUCTION FIX: Only deselect keystone1 if keystone2 is the active one
-            // This ensures only the ACTIVE keystone's corner is highlighted
-            int saved_selected_corner1 = -1;
-            if (app->keystone2 && app->active_keystone == 1 && app->keystone2->selected_corner >= 0) {
-                // Keystone 2 is active, temporarily hide keystone 1's selection
-                saved_selected_corner1 = app->keystone->selected_corner;
-                app->keystone->selected_corner = -1;
-            }
-
-            // Only render the overlays that are actually visible
-            if (app->keystone->show_corners) {
-                gl_render_corners(app->gl, app->keystone);
-            }
-            if (app->keystone->show_border) {
-                gl_render_border(app->gl, app->keystone);
-                gl_render_display_boundary(app->gl, app->keystone);
-            }
-            if (app->keystone->show_help) {
-                gl_render_help_overlay(app->gl, app->keystone);
-            }
-
-            // Restore keystone1's selection if it was hidden
-            if (saved_selected_corner1 >= 0) {
-                app->keystone->selected_corner = saved_selected_corner1;
-            }
-            
-            // NOTE: State restoration is now handled by gl_render_frame()
-            // The main video rendering function detects and fixes state corruption
-            
-            // Clear any OpenGL errors from overlay rendering
-            while (glGetError() != GL_NO_ERROR) {
-                // Clear error queue
-            }
-        }
-
-        // ALWAYS render help overlay if visible (even when other overlays aren't)
-        // This allows help to display on blank screen when video is hidden
-        if (app->keystone && app->keystone->show_help) {
-            gl_render_help_overlay(app->gl, app->keystone);
-        }
-        if (app->keystone2 && app->keystone2->show_help) {
-            gl_render_help_overlay(app->gl, app->keystone2);
-        }
-
-        // Render overlays for second keystone
-        // PRODUCTION FIX: Only render keystone2 overlays when video2 has valid frame data
-        // This prevents flickering during initial startup before first frame is decoded
-        // NOTE: Use first_frame_decoded2 instead of y_data2 for HW decode (y_data2 is NULL in HW path)
-        if (any_overlay_visible2 && first_frame_decoded2) {
-            // PRODUCTION FIX: Only deselect keystone2 if keystone1 is the active one
-            // This ensures only the ACTIVE keystone's corner is highlighted
-            int saved_selected_corner = -1;
-            if (app->active_keystone == 0 && app->keystone->selected_corner >= 0) {
-                // Keystone 1 is active, temporarily hide keystone 2's selection
-                saved_selected_corner = app->keystone2->selected_corner;
-                app->keystone2->selected_corner = -1;
-            }
-
-            if (app->keystone2->show_corners) {
-                gl_render_corners(app->gl, app->keystone2);
-            }
-            if (app->keystone2->show_border) {
-                gl_render_border(app->gl, app->keystone2);
-                gl_render_display_boundary(app->gl, app->keystone2);
-            }
-            if (app->keystone2->show_help) {
-                gl_render_help_overlay(app->gl, app->keystone2);
-            }
-
-            // Restore the selection
-            if (saved_selected_corner >= 0) {
-                app->keystone2->selected_corner = saved_selected_corner;
-            }
-
-            while (glGetError() != GL_NO_ERROR) {
-                // Clear error queue
-            }
-        }
-        
-        // Render notification overlay if active
+        const char *notification_message = NULL;
         if (app->notification_active) {
             struct timespec current_ts;
             clock_gettime(CLOCK_MONOTONIC, &current_ts);
@@ -1887,13 +1804,18 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
             double elapsed = current_time - app->notification_start_time;
 
             if (elapsed < app->notification_duration) {
-                // Notification is still active - render it with text
-                gl_render_notification_overlay(app->gl, app->notification_message);
+                notification_message = app->notification_message;
             } else {
-                // Notification expired
                 app->notification_active = false;
             }
         }
+
+        gl_render_osd(app->gl,
+                      app->keystone,
+                      app->keystone2,
+                      app->active_keystone,
+                      first_frame_decoded2,
+                      notification_message);
 
         clock_gettime(CLOCK_MONOTONIC, &overlay_end);
 

@@ -65,6 +65,21 @@ typedef struct {
     GLint corner_a_position;
     GLint corner_u_mvp_matrix;
     GLint corner_u_color;
+
+    // Instanced corner pipeline
+    GLuint corner_inst_program;
+    GLuint corner_inst_unit_vbo;
+    GLint corner_inst_a_unit_pos;
+    GLint corner_inst_u_mvp_matrix;
+    GLint corner_inst_u_corner_data;
+    GLint corner_inst_u_corner_color;
+
+    // OSD timing instrumentation
+    bool supports_timer_query;
+    GLuint osd_timer_queries[2];
+    GLuint corner_timer_queries[2];
+    int osd_timer_write_idx;
+    int corner_timer_write_idx;
     
     // Border rendering
     GLuint border_vbo;
@@ -110,6 +125,12 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_display_boundary(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_notification_overlay(gl_context_t *gl, const char *message);
+void gl_render_osd(gl_context_t *gl,
+                   keystone_context_t *keystone1,
+                   keystone_context_t *keystone2,
+                   int active_keystone,
+                   bool keystone2_ready,
+                   const char *notification_message);
 void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm);
 
 // DMA buffer zero-copy rendering (NV12 format) - legacy separate planes
